@@ -73,8 +73,11 @@ run, `-MorningTime 08:30`, `-NoSchedule`, `-NoOpencode`, `-Uninstall`.
 **Then check DRM readability on the target PC:**
 
 ```powershell
-& "$env:LOCALAPPDATA\worklog\venv\Scripts\worklog.exe" doctor --root "D:\업무" "D:\업무\샘플.docx" "D:\업무\샘플.xlsx" "D:\업무\샘플.pptx"
+& "$env:LOCALAPPDATA\worklog\venv\Scripts\worklog.exe" doctor --root "D:\업무"
 ```
+
+With no file arguments, `doctor` tests the 3 most recently modified files of each Office/PDF type
+in the folder (`--per-type N` to change that). It also accepts files, folders and wildcards.
 
 For a full step-by-step check on a new PC (tests, DRM, tracking, opencode, then the real install),
 see [docs/TESTING.md](docs/TESTING.md).
@@ -100,7 +103,7 @@ In opencode:
 - Telling the agent about off-file work ("오늘 A사 미팅 다녀왔어") stores a note for that day's log.
 
 CLI (`worklog <command> --root <folder>`): `init`, `scan`, `close`, `baseline`, `morning`, `status`,
-`changes [DAY]`, `diff ID`, `read PATH`, `search TEXT`, `render daily|weekly KEY`, `doctor`,
+`changes [DAY] [--diffs]`, `diff ID`, `read PATH`, `search TEXT`, `render daily|weekly [KEY]`, `doctor [PATHS]`,
 `setup-opencode`, `export-assets`, `mcp`.
 
 ## Data and privacy

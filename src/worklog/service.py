@@ -61,6 +61,20 @@ def _check_day(day: str) -> str:
         raise WorklogError(f"invalid date {day!r}; use YYYY-MM-DD") from None
 
 
+def format_diff(d: dict) -> str:
+    """Plain-text form of a ``Worklog.diff`` result: header lines, then the diff."""
+    head = f"# change {d['id']} · {d['kind']} · {d['path']} · {d['day']}"
+    if d.get("old_path"):
+        head += f" (from {d['old_path']})"
+    lines = [head]
+    if "total_lines" in d:
+        lines.append(f"# lines {d['offset'] + 1}-{d['offset'] + d['returned']} of {d['total_lines']}"
+                     + (" (more: use offset)" if d["truncated"] else ""))
+    if d.get("note"):
+        lines.append(f"# note: {d['note']}")
+    return "\n".join(lines) + "\n" + d.get("diff", "")
+
+
 class Worklog:
     def __init__(self, root: str | Path, create: bool = False):
         root = Path(root).expanduser()

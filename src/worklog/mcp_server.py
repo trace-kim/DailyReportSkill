@@ -9,7 +9,7 @@ import json
 import logging
 from typing import Optional
 
-from .service import Worklog, WorklogError
+from .service import Worklog, WorklogError, format_diff
 
 log = logging.getLogger(__name__)
 
@@ -95,18 +95,7 @@ def build_server(root: str):
         """Text diff of one change record (unified diff of the extracted text; Excel rows read
         'a | b | c', PowerPoint text is grouped under [슬라이드 N]). Page with offset."""
         d = wl.diff(change_id, max_lines=max_lines, offset=offset)
-        if not d.get("ok"):
-            return _json(d)
-        head = f"# change {d['id']} · {d['kind']} · {d['path']} · {d['day']}"
-        if d.get("old_path"):
-            head += f" (from {d['old_path']})"
-        lines = [head]
-        if "total_lines" in d:
-            lines.append(f"# lines {d['offset'] + 1}-{d['offset'] + d['returned']} of {d['total_lines']}"
-                         + (" (more: use offset)" if d["truncated"] else ""))
-        if d.get("note"):
-            lines.append(f"# note: {d['note']}")
-        return "\n".join(lines) + "\n" + d.get("diff", "")
+        return format_diff(d) if d.get("ok") else _json(d)
 
     @mcp.tool()
     @_safe

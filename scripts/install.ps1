@@ -148,7 +148,7 @@ if (-not $NoBaseline) {
 
 Write-Host ''
 Write-Host 'Done. Next steps:' -ForegroundColor Green
-Write-Host "  1. Check DRM readability:  & '$wl' doctor --root '$Root' <a DRM .docx> <a DRM .xlsx> <a DRM .pptx>"
+Write-Host "  1. Check DRM readability:  & '$wl' doctor --root '$Root'"
 Write-Host "  2. Status:                 & '$wl' status --root '$Root'"
 Write-Host '  3. In opencode:            /daily-report   and every 1-2 weeks  /weekly-report'
 Write-Host "  Logs: $Root\.worklog\logs"

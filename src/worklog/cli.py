@@ -60,6 +60,40 @@ def _opencode_report_command() -> list[str] | None:
     return [exe, "run", "--command", "daily-report", "--auto", "auto"] if exe else None
 
 
+def changes_text(wl, day: str | None = None, max_lines: int = 200) -> str:
+    """Every change of a day with its diff, readable in a console."""
+    from .service import format_diff
+
+    res = wl.changes(day, limit=100_000)
+    counts = ", ".join(f"{k} {n}" for k, n in res["summary"].items() if n)
+    out = [f"=== {res['day']}({res['weekday']}): {res['total']} change(s)" + (f" [{counts}]" if counts else "")]
+    for c in res["changes"]:
+        out.append("")
+        d = wl.diff(c["id"], max_lines=max_lines)
+        out.append(format_diff(d).rstrip() if d.get("ok") else f"# change {c['id']}: {d.get('errors')}")
+    if res["touched_only"]:
+        out += ["", "=== edited this day, net change recorded elsewhere or not yet:"]
+        out += [f"  {t['path']} ({t['seen']}): {t['note']}" for t in res["touched_only"]]
+    if not res["total"] and not res["touched_only"]:
+        out += ["", "No changes recorded. Run 'worklog close' first if files were edited."]
+    return "\n".join(out)
+
+
+def latest_report_key(wl, kind: str) -> str:
+    """Key of the most recent saved daily or weekly report."""
+    from .service import WorklogError
+
+    if kind == "daily":
+        reports = wl.reports.list_daily()
+        if reports:
+            return reports[-1]["date"]
+    else:
+        reports = [w for w in wl.reports.list_weekly() if w.get("period_to")]
+        if reports:
+            return max(reports, key=lambda w: w["period_to"])["key"]
+    raise WorklogError(f"no {kind} report saved yet")
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--root", default=os.environ.get("WORKLOG_ROOT"),
@@ -84,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", parents=[common], help="tracking and report status")
     s = sub.add_parser("changes", parents=[common], help="changes recorded for a day")
     s.add_argument("day", nargs="?", help="YYYY-MM-DD (default: today)")
+    s.add_argument("--diffs", action="store_true", help="print every change with its diff, as text")
     s = sub.add_parser("diff", parents=[common], help="diff of one change record")
     s.add_argument("change_id", type=int)
     s.add_argument("--max-lines", type=int, default=400)
@@ -94,11 +129,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("query")
     s = sub.add_parser("render", parents=[common], help="print a saved report")
     s.add_argument("kind", choices=["daily", "weekly"])
-    s.add_argument("key", help="date for daily, FROM_TO for weekly")
+    s.add_argument("key", nargs="?", help="date for daily, FROM_TO for weekly (default: the latest one)")
     s.add_argument("--format", default="text", choices=["text", "md"])
     sub.add_parser("mcp", parents=[common], help="run the MCP server on stdio")
     s = sub.add_parser("doctor", parents=[common], help="check Python, Office/COM, DRM readability")
-    s.add_argument("files", nargs="*", help="sample files to test (e.g. a DRM-protected .docx/.xlsx/.pptx)")
+    s.add_argument("paths", nargs="*",
+                   help="files, folders or wildcard patterns to test (default: sample the --root folder)")
+    s.add_argument("--per-type", type=int, default=3,
+                   help="files tested per extension when searching a folder (default 3, 0 = all)")
     s.add_argument("--out", help="also write the JSON report to this file")
     s.add_argument("--no-preview", action="store_true", help="do not include text previews")
     s.add_argument("--no-com", action="store_true", help="skip Office automation checks")
@@ -131,8 +169,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd == "doctor":
         from .doctor import run_doctor
 
-        report = run_doctor(root if (args.root or (root / ".worklog").exists()) else None, args.files,
-                            preview=not args.no_preview, com=not args.no_com)
+        report = run_doctor(root if (args.root or (root / ".worklog").exists()) else None, args.paths,
+                            preview=not args.no_preview, com=not args.no_com, per_type=args.per_type)
         if args.out:
             Path(args.out).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         _print(report)
@@ -145,7 +183,7 @@ def main(argv: list[str] | None = None) -> None:
                               not args.no_skill, not args.no_commands, args.remove, args.timeout_ms))
         return
 
-    from .service import Worklog, WorklogError
+    from .service import Worklog, WorklogError, format_diff
 
     try:
         if args.cmd == "mcp":
@@ -183,17 +221,17 @@ def main(argv: list[str] | None = None) -> None:
         elif args.cmd == "status":
             result = wl.status()
         elif args.cmd == "changes":
-            result = wl.changes(args.day)
+            result = changes_text(wl, args.day) if args.diffs else wl.changes(args.day)
         elif args.cmd == "diff":
             d = wl.diff(args.change_id, max_lines=args.max_lines)
-            result = (d.get("note", "") + "\n" + d.get("diff", "")).strip() if d.get("ok") else d
+            result = format_diff(d) if d.get("ok") else d
         elif args.cmd == "read":
             r = wl.read_file(args.path, max_chars=args.max_chars)
             result = r["text"] if r.get("kind") == "text" else r
         elif args.cmd == "search":
             result = wl.search(args.query)
         elif args.cmd == "render":
-            r = wl.render(args.kind, args.key, args.format)
+            r = wl.render(args.kind, args.key or latest_report_key(wl, args.kind), args.format)
             result = r["content"] if r.get("ok") else r
         else:  # pragma: no cover
             raise WorklogError(f"unknown command {args.cmd}")
