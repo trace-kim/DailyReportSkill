@@ -76,6 +76,9 @@ run, `-MorningTime 08:30`, `-NoSchedule`, `-NoOpencode`, `-Uninstall`.
 & "$env:LOCALAPPDATA\worklog\venv\Scripts\worklog.exe" doctor --root "D:\업무" "D:\업무\샘플.docx" "D:\업무\샘플.xlsx" "D:\업무\샘플.pptx"
 ```
 
+For a full step-by-step check on a new PC (tests, DRM, tracking, opencode, then the real install),
+see [docs/TESTING.md](docs/TESTING.md).
+
 `doctor` reports, for each sample, whether it can be read directly or only through Office, how long
 that takes, whether the session is interactive, and whether files that Python writes into the folder
 stay readable (some DRM clients encrypt every new file). To test the scheduled-task context too,
