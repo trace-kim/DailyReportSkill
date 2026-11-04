@@ -46,8 +46,9 @@ max_text_chars = 2000000
 com_enabled = true
 com_timeout_sec = 90
 # Let Word open PDFs that cannot be parsed directly (slow: Word converts them).
+# DRM-protected PDFs are not sent to Word: its converter cannot read them.
 # While worklog's hidden Word runs, Word's PDF-conversion prompt is suppressed
-# (HKCU ...\Word\Options\DisableConvertPdfWarning) and restored afterwards.
+# (HKCU ...\\Word\\Options\\DisableConvertPdfWarning) and restored afterwards.
 com_pdf_via_word = true
 # Extra extensions to read as plain text, e.g. [".sas", ".vba"].
 extra_text_extensions = []
@@ -71,7 +72,9 @@ on_hold = "보류중입니다"
 
 [automation]
 # Command started by `worklog morning` after the close-out, run in the work folder.
-# Example: ["opencode", "run", "--command", "daily-report", "--auto", "auto"]
+# Example: ["opencode", "run", "--model", "provider/model", "--command", "daily-report", "--auto", "auto"]
+# Name the model: without --model, opencode uses the model last picked in its TUI.
+# A run that leaves days without a report makes `morning` fail and shows up in `status`.
 report_command = []
 report_timeout_min = 30
 # Minutes of baseline text extraction done by each `worklog morning` run.

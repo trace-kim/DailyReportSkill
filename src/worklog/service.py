@@ -6,6 +6,8 @@ import datetime as dt
 import functools
 import json
 import logging
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,7 +19,7 @@ from pathlib import Path
 from . import context
 from .closeout import candidate_counts, run_baseline, run_close
 from .config import Config, set_report_command, write_default_config
-from .db import connect, get_meta
+from .db import connect, get_meta, set_meta
 from .extract import Extractor
 from .ignore import IgnoreRules
 from .reports import Reports
@@ -59,6 +61,24 @@ def _check_day(day: str) -> str:
         return dt.date.fromisoformat(str(day)).isoformat()
     except ValueError:
         raise WorklogError(f"invalid date {day!r}; use YYYY-MM-DD") from None
+
+
+# Terminal escape sequences: CSI (colors, cursor moves), OSC (titles, links), other two-byte escapes.
+_ANSI = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])")
+
+
+def strip_ansi(data: bytes) -> bytes:
+    return _ANSI.sub(b"", data)
+
+
+def log_tail(path: Path, lines: int = 12, max_chars: int = 2000) -> str:
+    """Last non-empty lines of an agent log, for the failure message."""
+    try:
+        text = strip_ansi(path.read_bytes()).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    kept = [ln.rstrip() for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if ln.strip()]
+    return "\n".join(kept[-lines:])[-max_chars:]
 
 
 def format_diff(d: dict) -> str:
@@ -240,6 +260,15 @@ class Worklog:
                          "full content instead of a diff. The 'baseline' tool or `worklog baseline` continues it.")
         if older:
             hints.append(f"{older} older day(s) without reports are not listed.")
+        last_run = self._last_report_run()
+        if last_run and not last_run.get("ok"):
+            still = sorted(set(last_run.get("missing") or []) & {n["day"] for n in needing})
+            if still:
+                why = last_run.get("error") or (f"exit code {last_run.get('returncode')}"
+                                                if last_run.get("returncode") else "it saved nothing")
+                hints.append(f"The scheduled report run at {_iso(last_run.get('at'))} did not write the log for "
+                             f"{', '.join(still)} ({why}); its output is in {last_run.get('log')}. Tell the user: "
+                             "the usual cause is a report_command in config.toml without --model.")
         return {
             "root": str(self.ws.root),
             "today": today,
@@ -253,6 +282,8 @@ class Worklog:
             "today_changes": per_day[today]["reportable"] if today in per_day else 0,
             "days_needing_report": needing,
             "daily_reports": len(self.reports.list_daily()),
+            "last_report_run": ({"at": _iso(last_run.get("at")), "ok": bool(last_run.get("ok")),
+                                 "missing": last_run.get("missing") or []} if last_run else None),
             "weekly": self.reports.weekly_state(today),
             "topics_active": [
                 {"id": t["id"], "name": t.get("name"), "status": t.get("status")}
@@ -443,7 +474,24 @@ class Worklog:
 
     @_locked
     def topic_upsert(self, topic_id=None, name=None, description=None, status=None, paths=None, aliases=None) -> dict:
-        return self.topics.upsert(topic_id, name, description, status, paths, aliases, today=self.cfg.today())
+        warnings: list[str] = []
+        if paths is not None:
+            norm = []
+            for p in [paths] if isinstance(paths, str) else paths:
+                if not str(p or "").strip():
+                    continue
+                try:  # "." / "./" / the absolute root all become "."; "A사\\" becomes "A사"
+                    norm.append(self.ws.to_rel(str(p), allow_root=True))
+                except ValueError as e:
+                    return {"ok": False, "errors": [f"paths: {e}"]}
+            if "." in norm:
+                warnings.append("paths: '.' is the whole work folder, so every file matches this topic; "
+                                "list the subfolders or files that belong to it if the topic is narrower")
+            paths = norm
+        res = self.topics.upsert(topic_id, name, description, status, paths, aliases, today=self.cfg.today())
+        if warnings and res.get("ok"):
+            res["warnings"] = warnings
+        return res
 
     @_locked
     def daily_save(self, report) -> dict:
@@ -474,7 +522,13 @@ class Worklog:
     # automation
     # ------------------------------------------------------------------
     def morning(self) -> dict:
-        """Scheduled routine: close out, continue the baseline, start the report agent."""
+        """Scheduled routine: close out, continue the baseline, start the report agent.
+
+        The agent's exit code is not trusted: opencode exits 0 even when the model
+        never called a tool. Success means every day that needed a report has one
+        afterwards; anything else makes the result ``ok: false`` and is shown by
+        ``status`` until those days are written.
+        """
         lock = FileLock(self.ws.lock_path("morning"))
         if not lock.acquire():
             return {"ok": False, "busy": True, "message": "a morning run is already in progress"}
@@ -485,10 +539,36 @@ class Worklog:
             days = [d["day"] for d in self.status()["days_needing_report"]]
             out["days_needing_report"] = days
             if self.cfg.report_command and days:
-                out["report_command"] = self._run_report_command()
+                run = self._run_report_command()
+                left = {d["day"] for d in self.status()["days_needing_report"]}
+                run["written"] = [d for d in days if d not in left]
+                run["missing"] = [d for d in days if d in left]
+                run["ok"] = not run.get("error") and run.get("returncode") == 0 and not run["missing"]
+                if not run["ok"]:
+                    run["log_tail"] = log_tail(Path(run["log"]))
+                    out["ok"] = False
+                    log.warning("morning: report command %s; %d of %d day(s) still without a report (%s); "
+                                "output: %s", run.get("error") or f"exited with {run.get('returncode')}",
+                                len(run["missing"]), len(days), ", ".join(run["missing"]) or "-", run["log"])
+                else:
+                    log.info("morning: reports written for %s", ", ".join(run["written"]))
+                out["report_command"] = run
+                with self._lock:
+                    set_meta(self.con, "last_report_run", json.dumps(
+                        {"at": time.time(), **{k: run.get(k) for k in
+                                               ("ok", "returncode", "error", "written", "missing", "log")}},
+                        ensure_ascii=False))
+                    self.con.commit()
             return out
         finally:
             lock.release()
+
+    def _last_report_run(self) -> dict | None:
+        raw = get_meta(self.con, "last_report_run")
+        try:
+            return json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            return None
 
     def _run_report_command(self) -> dict:
         cmd = list(self.cfg.report_command)
@@ -496,13 +576,24 @@ class Worklog:
         cmd = (["cmd.exe", "/c", exe] if exe.lower().endswith((".cmd", ".bat")) else [exe]) + cmd[1:]
         self.ws.logs_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.ws.logs_dir / f"report-{dt.datetime.now():%Y%m%d-%H%M%S}.log"
+        out: dict = {"command": cmd, "log": str(log_path)}
+        # Ask for plain output; escapes that are printed anyway are stripped below.
+        env = {**os.environ, "NO_COLOR": "1", "FORCE_COLOR": "0"}
         try:
             with log_path.open("wb") as f:
                 proc = subprocess.run(cmd, cwd=self.ws.root, stdout=f, stderr=subprocess.STDOUT,
                                       stdin=subprocess.DEVNULL, timeout=self.cfg.report_timeout_min * 60,
-                                      creationflags=_NO_WINDOW)
-            return {"command": cmd, "returncode": proc.returncode, "log": str(log_path)}
+                                      creationflags=_NO_WINDOW, env=env)
+            out["returncode"] = proc.returncode
         except subprocess.TimeoutExpired:
-            return {"command": cmd, "error": "timed out", "log": str(log_path)}
+            out["error"] = f"timed out after {self.cfg.report_timeout_min:g} min"
         except OSError as e:
-            return {"command": cmd, "error": str(e), "log": str(log_path)}
+            out["error"] = str(e)
+        try:
+            data = log_path.read_bytes()
+            clean = strip_ansi(data)
+            if clean != data:
+                log_path.write_bytes(clean)
+        except OSError:
+            pass
+        return out

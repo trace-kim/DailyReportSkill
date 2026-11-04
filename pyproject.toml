@@ -14,7 +14,7 @@ dependencies = [
   "python-docx>=1.1",
   "openpyxl>=3.1",
   "python-pptx>=0.6.23",
-  "pypdf>=4.0",
+  "pypdf[crypto]>=4.0",  # AES-encrypted PDFs with an empty user password are common
   "Pillow>=10.0",
   "pywin32>=306; sys_platform == 'win32'",
   "tomli>=2.0; python_version < '3.11'",

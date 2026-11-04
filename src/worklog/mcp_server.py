@@ -176,7 +176,9 @@ def build_server(root: str):
     ) -> str:
         """Create a topic (omit topic_id; name required, a specific Korean noun phrase such as
         'A사 제안서 작성') or update one (pass topic_id). status: started | in_progress |
-        reviewing | done | on_hold. paths: folder prefixes that belong to the topic."""
+        reviewing | done | on_hold. paths: subfolders or files (relative to the work folder) that
+        belong to the topic, e.g. ['프로젝트/A사']; for files directly in the work folder list the
+        files ('.' would match every file)."""
         return _json(wl.topic_upsert(topic_id, name, description, status, paths, aliases))
 
     # ------------------------------------------------------------ reports

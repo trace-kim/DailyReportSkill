@@ -10,6 +10,6 @@ Arguments: "$ARGUMENTS"
 Essentials:
 1. Every day in the period with recorded changes must have a daily log; write missing ones first.
 2. Read all daily logs in the period, group the items by topic, keep what a senior manager should hear, and merge small related topics.
-3. One entry per topic: `subject` (the object noun phrase, without 을/를), `status`, and one `paragraph` in 존댓말 보고체. Every sentence ends with "~니다.". Use 3-6 sentences: 배경 → 수행 내용 (구체적 수치·날짜·산출물) → 현재 상태 → 향후 계획.
+3. One entry per topic: `subject` (the object noun phrase, without 을/를), `status`, and one `paragraph` in 존댓말 보고체. Every sentence ends with "~니다.". Use 2-6 sentences: 배경 → 수행 내용 (구체적 수치·날짜·산출물) → 현재 상태 → 향후 계획. Only 수행 내용 and 현재 상태 are required: write 배경, causes and 향후 계획 only when a daily log, note or document states them, and never invent them.
 4. `weekly_save`; fix every error and retry.
 5. Show the final text to the user and ask for review. Do not send it anywhere unless explicitly asked.

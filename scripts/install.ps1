@@ -7,6 +7,15 @@
     powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Root "D:\Work"
 
 .EXAMPLE
+    # Name the model of the unattended daily-report run (see: opencode models).
+    powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Root "D:\Work" -Model "provider/model"
+
+.EXAMPLE
+    # DS Cowork only: register in the work folder as its workspace; its bundled opencode cannot be
+    # started by the morning task, so the daily report is scheduled inside the app instead.
+    powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Root "D:\Work" -Workspace -Report none
+
+.EXAMPLE
     # Offline PC: build the wheelhouse elsewhere with
     #   python -m pip wheel . -w wheelhouse
     powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Root "D:\Work" -Wheelhouse .\wheelhouse
@@ -23,7 +32,9 @@ param(
     [string]$Package = '',
     [string]$Wheelhouse = '',
     [ValidateSet('auto', 'opencode', 'none')][string]$Report = 'auto',
+    [string]$Model = '',
     [string]$MorningTime = '09:00',
+    [switch]$Workspace,
     [switch]$NoOpencode,
     [switch]$NoSchedule,
     [switch]$NoBaseline,
@@ -57,7 +68,8 @@ if ($Uninstall) {
     }
     if (Test-Path -LiteralPath $wl) {
         & $wl setup-opencode --root $Root --remove | Out-Null
-        Write-Host 'removed the opencode registration (MCP entry, skill, commands)'
+        & $wl setup-opencode --root $Root --remove --workspace | Out-Null
+        Write-Host 'removed the opencode registrations (global and workspace: MCP entry, skill, commands)'
     }
     Write-Host "Tracking data in $Root\.worklog was kept. Delete it manually if it is no longer needed."
     return
@@ -96,12 +108,21 @@ if ($LASTEXITCODE -ne 0) { throw 'pip install failed' }
 
 # ---------------------------------------------------------------- init
 Write-Step "Initializing tracking for $Root"
-& $wl init --root $Root --report $Report
+$initArgs = @('init', '--root', $Root, '--report', $Report)
+if ($Model) { $initArgs += @('--model', $Model) }
+& $wl @initArgs
 if ($LASTEXITCODE -ne 0) { throw 'worklog init failed' }
 
 if (-not $NoOpencode) {
-    Write-Step 'Registering the MCP server, skill and commands with opencode'
-    & $wl setup-opencode --root $Root --python $py
+    $setupArgs = @('setup-opencode', '--root', $Root, '--python', $py)
+    if ($Workspace) {
+        Write-Step 'Registering the MCP server, skill and commands in the work folder (workspace)'
+        $setupArgs += '--workspace'
+    }
+    else {
+        Write-Step 'Registering the MCP server, skill and commands with opencode'
+    }
+    & $wl @setupArgs
     if ($LASTEXITCODE -ne 0) { throw 'setup-opencode failed' }
 }
 
@@ -150,5 +171,12 @@ Write-Host ''
 Write-Host 'Done. Next steps:' -ForegroundColor Green
 Write-Host "  1. Check DRM readability:  & '$wl' doctor --root '$Root'"
 Write-Host "  2. Status:                 & '$wl' status --root '$Root'"
-Write-Host '  3. In opencode:            /daily-report   and every 1-2 weeks  /weekly-report'
+if ($Workspace) {
+    Write-Host "  3. In DS Cowork:           open $Root as the workspace and reload it, then"
+    Write-Host '                             /daily-report   and every 1-2 weeks  /weekly-report'
+    Write-Host '                             (schedule the daily report in the app: see docs\TESTING.md)'
+}
+else {
+    Write-Host '  3. In opencode:            /daily-report   and every 1-2 weeks  /weekly-report'
+}
 Write-Host "  Logs: $Root\.worklog\logs"

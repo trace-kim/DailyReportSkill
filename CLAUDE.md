@@ -71,8 +71,13 @@ python-docx/openpyxl/python-pptx/pypdf), then Office COM (`COM_APPS`). Adding a 
 one reader there. `extract/com.py` is delicate:
 - each Office app runs in its own worker thread with timeouts and a circuit breaker
 - Word and Excel use `DispatchEx` (private hidden instances)
-- PowerPoint is single-instance: it is shared with the user and never quit or killed if the user owns it
+- PowerPoint is single-instance: it is shared with the user and never quit or killed if the user owns it.
+  Even when worklog started it, the user's presentations can land in it, so its settings
+  (`_SETTINGS`) are applied per job and restored (`run_job`), and it is not quit while presentations are open
 - files are opened read-only with macros, alerts, MRU and link updates off, and a dummy password so prompts fail fast
+- Word loads a PDF its converter cannot read (DRM-protected) as plain text, even with the PDF converter
+  forced (`Format=27`). `Extractor.extract` therefore skips Word for PDFs without a `%PDF-` header on
+  disk (except when `doctor` forces `method="com"`), and `looks_like_pdf_source` rejects such output
 - Word's PDF-conversion prompt is suppressed by temporarily setting the HKCU value `DisableConvertPdfWarning`, restored in `shutdown()`
 
 Always use `Extractor` as a context manager so Office instances are closed.
@@ -93,6 +98,9 @@ Daily reports store `covered_change_ids`, which is how `status` detects missing 
 `setup-opencode` installs them into the opencode config dir (`~/.config/opencode` or
 `$OPENCODE_CONFIG_DIR`) along with the `mcp.worklog` entry. Changing how the agent writes reports
 usually means editing those markdown files, not Python. opencode exposes the tools as `worklog_<name>`.
+`setup-opencode --workspace [DIR]` registers per workspace instead (`DIR/opencode.jsonc`,
+`DIR/.opencode/skills|commands`): DS Cowork's bundled opencode reads only that. Config backups go to
+`%LOCALAPPDATA%\worklog\backups`, never next to the config, because a workspace is usually the work folder.
 
 **MCP server.** Supports both mcp 2.x (`MCPServer`) and 1.x (`FastMCP`). `mcp_server.py`
 deliberately has no `from __future__ import annotations`, because the SDK evaluates annotations at
@@ -103,7 +111,10 @@ text. The tool docstrings are the agent-facing documentation.
 editable), runs `init` and `setup-opencode`, and registers two Task Scheduler tasks with the
 Interactive logon type, because COM and DRM clients need the user's session. The tasks are an
 hourly `scan` and a morning `morning`, which closes out, continues the baseline, and runs
-`report_command` (`opencode run --command daily-report --auto auto`) when days need reports. Tasks
+`report_command` (`opencode run --model M --command daily-report --auto auto`) when days need reports.
+opencode exits 0 even when the model never called a tool, so `morning` judges the run by
+`days_needing_report` afterwards: leftover days make it fail, are stored in `meta.last_report_run`
+and surface as a `status` hint. ANSI escapes are stripped from `logs/report-*.log`. Tasks
 use `worklogw` (gui-script, no console window). `FileLock` (msvcrt) keeps scan/close/morning runs
 from overlapping.
 
@@ -120,4 +131,8 @@ from overlapping.
   purpose, and disable COM unless `make_wl(com=True)`. Use `wl.cfg.today()`, not the calendar date,
   in date-dependent tests (the day boundary is 04:00).
 - `time.monotonic()` on Windows has about 15.6 ms resolution; zero-length budgets and timing
-  assertions must account for that.
+  assertions must account for that. File mtimes also come from that coarse clock while
+  `installed_at` uses `time.time()`, so a write right after `init` can be stamped before it:
+  tests that edit right after `make_wl()` should `backdate_tracking` first.
+- COM tests disable pytest's faulthandler (`tests/test_com.py`): COM raises SEH exceptions that
+  the RPC runtime handles, which faulthandler would print as "Windows fatal exception".

@@ -47,6 +47,19 @@ def _err(e: BaseException) -> str:
     return f"{type(e).__name__}: {msg}" if msg else type(e).__name__
 
 
+def has_pdf_header(path: Path) -> bool:
+    """A "%PDF-" header within the first 1024 bytes, where PDF readers look for it."""
+    try:
+        with open(path, "rb") as f:
+            return b"%PDF-" in f.read(1024)
+    except OSError:
+        return True  # let the readers report the real error
+
+
+DRM_PDF_SKIP = ("skipped: the file is not a PDF as stored on disk (DRM-protected?); Word cannot convert "
+                "such PDFs, it only loads their bytes as plain text")
+
+
 class Extractor:
     """Use as a context manager so hidden Office instances are always closed."""
 
@@ -119,6 +132,12 @@ class Extractor:
                 return ExtractResult("failed", error=str(e), meta=meta)
             except Exception as e:
                 errors.append(f"direct: {_err(e)}")
+        if ext == ".pdf" and app == "word" and method is None and not has_pdf_header(path):
+            # A DRM container: Word's PDF converter cannot read it and Word falls back to a
+            # plain-text load, which costs a Word round trip per file and per retry for
+            # nothing. doctor (method="com") still tries, to notice a DRM where Word can convert.
+            errors.append(f"com: {DRM_PDF_SKIP}")
+            app = None
         if app is not None and method in (None, "com"):
             if not self.cfg.com_enabled:
                 errors.append("com: disabled in config")

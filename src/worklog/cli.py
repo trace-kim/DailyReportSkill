@@ -48,16 +48,19 @@ def _ok(obj) -> bool:
     return not (isinstance(obj, dict) and obj.get("ok") is False)
 
 
-def _opencode_report_command() -> list[str] | None:
-    """Unattended daily-report run: `opencode run --command daily-report --auto auto`.
+def _opencode_report_command(model: str | None = None) -> list[str] | None:
+    """Unattended daily-report run: `opencode run [--model M] --command daily-report --auto auto`.
 
     --auto approves tool permissions that are not explicitly denied, so the
-    scheduled run never stalls on a prompt nobody can answer.
+    scheduled run never stalls on a prompt nobody can answer. Without --model,
+    opencode uses the model last picked in its TUI, which may not call tools.
     """
     import shutil
 
     exe = shutil.which("opencode")
-    return [exe, "run", "--command", "daily-report", "--auto", "auto"] if exe else None
+    if not exe:
+        return None
+    return [exe, "run", *(["--model", model] if model else []), "--command", "daily-report", "--auto", "auto"]
 
 
 def changes_text(wl, day: str | None = None, max_lines: int = 200) -> str:
@@ -108,6 +111,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--report", choices=["keep", "none", "opencode", "auto"], default="keep",
                    help="agent started by 'morning' to write daily logs: opencode, auto (opencode if found), "
                         "none, or keep the configured one (default)")
+    s.add_argument("--model", metavar="PROVIDER/MODEL",
+                   help="model for the unattended opencode run (with --report opencode or auto); list them with "
+                        "`opencode models`. Without it opencode uses the model last picked in its TUI")
     s.add_argument("--report-command", help='custom JSON array instead of --report, e.g. ["my-agent","run","/daily-report"]')
     sub.add_parser("scan", parents=[common], help="hourly metadata scan (size/mtime only)")
     s = sub.add_parser("close", parents=[common], help="close out changes: extract text, store diffs")
@@ -141,7 +147,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-preview", action="store_true", help="do not include text previews")
     s.add_argument("--no-com", action="store_true", help="skip Office automation checks")
     s = sub.add_parser("setup-opencode", parents=[common], help="register MCP server, skill and commands in opencode")
-    s.add_argument("--config", help="opencode config file (default: ~/.config/opencode/opencode.json)")
+    s.add_argument("--workspace", nargs="?", const="", metavar="DIR",
+                   help="register in a workspace folder instead of the global opencode config: DIR/opencode.jsonc "
+                        "and DIR/.opencode/ (what DS Cowork reads). DIR defaults to the --root folder")
+    s.add_argument("--config", help="opencode config file (default: opencode.jsonc or opencode.json in "
+                                    "~/.config/opencode, or in the workspace with --workspace)")
     s.add_argument("--python", help="python.exe used to launch the MCP server (default: this interpreter)")
     s.add_argument("--no-skill", action="store_true")
     s.add_argument("--no-commands", action="store_true")
@@ -179,8 +189,12 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd == "setup-opencode":
         from .opencode_setup import setup_opencode
 
+        workspace = None
+        if args.workspace is not None:
+            workspace = Path(args.workspace).expanduser().resolve() if args.workspace else root
         _print(setup_opencode(root, Path(args.config) if args.config else None, args.python,
-                              not args.no_skill, not args.no_commands, args.remove, args.timeout_ms))
+                              not args.no_skill, not args.no_commands, args.remove, args.timeout_ms,
+                              workspace=workspace))
         return
 
     from .service import Worklog, WorklogError, format_diff
@@ -193,20 +207,36 @@ def main(argv: list[str] | None = None) -> None:
             return
         if args.cmd == "init":
             cmd = None
+            warnings: list[str] = []
+            if args.model is not None:
+                if args.report_command or args.report not in ("opencode", "auto"):
+                    raise WorklogError("--model needs --report opencode or --report auto")
+                if "/" not in args.model:
+                    raise WorklogError(f"--model must be PROVIDER/MODEL with a forward slash, got {args.model!r} "
+                                       "(`opencode models` lists them)")
             if args.report_command:
                 cmd = json.loads(args.report_command)
                 if not (isinstance(cmd, list) and all(isinstance(c, str) for c in cmd)):
                     raise WorklogError("--report-command must be a JSON array of strings")
             elif args.report in ("opencode", "auto"):
-                cmd = _opencode_report_command()
+                cmd = _opencode_report_command(args.model)
                 if cmd is None:
                     if args.report == "opencode":
                         raise WorklogError("opencode was not found on PATH")
-                    log.warning("opencode not found: 'morning' will close out changes but not start an agent")
+                    warnings.append("opencode is not on PATH: 'morning' closes out changes but starts no agent. "
+                                    "With DS Cowork, schedule the daily report in the app instead.")
                     cmd = []
+                elif not args.model:
+                    warnings.append("no --model: the scheduled `opencode run` uses the model last picked in the "
+                                    "opencode TUI, and a model that cannot call tools writes nothing. Run init "
+                                    "again with --model PROVIDER/MODEL (see `opencode models`).")
             elif args.report == "none":
                 cmd = []
             _wl, result = Worklog.init(root, cmd)
+            for w in warnings:
+                log.warning("init: %s", w)
+            if warnings:
+                result["warnings"] = warnings
             _print(result)
             return
         wl = Worklog(root)
@@ -235,7 +265,11 @@ def main(argv: list[str] | None = None) -> None:
             result = r["content"] if r.get("ok") else r
         else:  # pragma: no cover
             raise WorklogError(f"unknown command {args.cmd}")
-        log.info("%s: %s", args.cmd, "ok" if _ok(result) else result)
+        if _ok(result):
+            log.info("%s: ok", args.cmd)
+        else:
+            log.warning("%s: failed: %s", args.cmd,
+                        json.dumps(result, ensure_ascii=False, default=str)[:4000])
         _print(result)
         if not _ok(result):
             sys.exit(1)

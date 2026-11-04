@@ -149,6 +149,9 @@ def test_change_before_baseline_is_flagged(root: Path, make_wl):
     f = root / "a.txt"
     f.write_text("v1", encoding="utf-8")
     wl = make_wl()
+    # File mtimes come from the coarse system clock (~15.6 ms ticks), installed_at from
+    # time.time(): a write right after init can be stamped *before* installed_at.
+    backdate_tracking(wl, dt.datetime.now() - dt.timedelta(minutes=1))
     f.write_text("v2 longer", encoding="utf-8")
     wl.close()
     (change,) = wl.changes(_today(wl))["changes"]

@@ -1,6 +1,8 @@
 """Office COM extraction. Needs Word/Excel/PowerPoint: run with WORKLOG_TEST_COM=1."""
 
+import faulthandler
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,22 @@ pytestmark = [
     pytest.mark.com,
     pytest.mark.skipif(os.environ.get("WORKLOG_TEST_COM") != "1", reason="set WORKLOG_TEST_COM=1 to run"),
 ]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _quiet_faulthandler():
+    """Keep pytest's faulthandler from printing handled COM exceptions.
+
+    Releasing the last reference to an Office instance that has already quit raises
+    0x800706BE (RPC call failed), which the RPC runtime handles itself. On Windows,
+    faulthandler prints every such exception as "Windows fatal exception" with a
+    traceback, although nothing crashed. Set up before `ex`, torn down after it.
+    """
+    was_enabled = faulthandler.is_enabled()
+    faulthandler.disable()
+    yield
+    if was_enabled:
+        faulthandler.enable(file=sys.__stderr__)
 
 
 @pytest.fixture(scope="module")
@@ -51,6 +69,27 @@ def test_pdf_via_word(ex, tmp_path: Path):
     r = ex.extract(p, method="com")
     assert r.kind == "text", r.error
     assert "Revenue 1350" in r.text
+
+
+def test_pdf_word_cannot_convert_is_a_failure(ex, tmp_path: Path):
+    # Like a DRM-protected PDF: the bytes Word's PDF converter checks are not a PDF, so Word
+    # loads the file as plain text and returns the PDF syntax. That must not count as text.
+    plain = make_pdf(tmp_path / "plain.pdf", ["Revenue 1350"])
+    p = tmp_path / "drm-like.pdf"
+    p.write_bytes(b"<## DRM Header ##>" + bytes(range(256)) * 2 + plain.read_bytes())
+    r = ex.extract(p, method="com")  # forced, as doctor does
+    assert r.kind == "failed" and "raw PDF source" in r.error, (r.text or "")[:200]
+
+
+def test_password_pdf_via_word_fails(ex, tmp_path: Path):
+    from pypdf import PdfWriter
+
+    w = PdfWriter(clone_from=str(make_pdf(tmp_path / "plain.pdf", ["Revenue 1350"])))
+    w.encrypt("secret", algorithm="AES-256")
+    p = tmp_path / "locked.pdf"
+    w.write(str(p))
+    r = ex.extract(p, method="com")
+    assert r.kind == "failed", (r.text or "")[:200]
 
 
 def test_com_failure_is_reported(ex, tmp_path: Path):

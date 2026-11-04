@@ -253,8 +253,11 @@ class Workspace:
     def lock_path(self, name: str) -> Path:
         return self.locks_dir / f"{name}.lock"
 
-    def to_rel(self, path: str) -> str:
-        """Normalize a user/agent supplied path to a root-relative POSIX path."""
+    def to_rel(self, path: str, allow_root: bool = False) -> str:
+        """Normalize a user/agent supplied path to a root-relative POSIX path.
+
+        The work folder itself is an error unless ``allow_root``; then it is ".".
+        """
         p = Path(str(path).strip().strip('"'))
         if not p.is_absolute():
             p = self.root / p
@@ -264,6 +267,8 @@ class Workspace:
         except ValueError:
             raise ValueError(f"path is outside the work folder: {path}") from None
         if rel == ".":
+            if allow_root:
+                return rel
             raise ValueError("path is the work folder itself")
         if rel.split("/")[0] == WORKLOG_DIRNAME:
             raise ValueError("the .worklog folder is internal to worklog")

@@ -12,6 +12,8 @@ Safety rules implemented here:
   it: then we never Quit() it and never kill it.
 * Files are opened read-only, without alerts, macros, link updates or MRU
   entries, and closed without saving.
+* On a PowerPoint instance the user can be in, alerts and macro security are
+  changed only while a file is being read and restored right after.
 """
 
 from __future__ import annotations
@@ -112,6 +114,8 @@ def _hwnd_pid(app_key: str, app) -> int | None:
 
 def com_error_text(e: BaseException) -> str:
     """Readable message for pywintypes.com_error (which nests the real cause)."""
+    if isinstance(e, ComError):
+        return str(e)
     args = getattr(e, "args", ())
     if len(args) >= 3 and isinstance(args[2], tuple) and len(args[2]) >= 3 and args[2][2]:
         return f"{args[1]}: {str(args[2][2]).strip()}"
@@ -121,28 +125,77 @@ def com_error_text(e: BaseException) -> str:
 
 
 # --------------------------------------------------------------------------
+# application settings
+# --------------------------------------------------------------------------
+# AutomationSecurity 3 = msoAutomationSecurityForceDisable: never run macros in opened files.
+_SETTINGS: dict[str, list[tuple[str, object]]] = {
+    "word": [("Visible", False), ("ScreenUpdating", False), ("DisplayAlerts", 0),  # wdAlertsNone
+             ("AutomationSecurity", 3)],
+    "excel": [("Visible", False), ("ScreenUpdating", False), ("DisplayAlerts", False),
+              ("EnableEvents", False), ("AutomationSecurity", 3)],
+    "powerpoint": [("DisplayAlerts", 1), ("AutomationSecurity", 3)],  # ppAlertsNone
+}
+# Never touched on an instance the user works in: it would hide or freeze their windows.
+_OWN_INSTANCE_ONLY = {"Visible", "ScreenUpdating"}
+
+
+def app_settings(app_key: str, shared: bool) -> list[tuple[str, object]]:
+    return [(k, v) for k, v in _SETTINGS[app_key] if not (shared and k in _OWN_INSTANCE_ONLY)]
+
+
+def apply_settings(app, settings) -> list[tuple[str, object]]:
+    """Set application properties (best effort); return the previous values of those changed."""
+    previous: list[tuple[str, object]] = []
+    for name, value in settings:
+        try:
+            old = getattr(app, name)
+        except Exception:
+            old = None
+        if old == value:
+            continue
+        try:
+            setattr(app, name, value)
+        except Exception as e:
+            log.debug("cannot set %s: %s", name, com_error_text(e))
+            continue
+        if old is not None:
+            previous.append((name, old))
+    return previous
+
+
+def restore_settings(app, previous) -> None:
+    for name, value in reversed(previous):
+        try:
+            setattr(app, name, value)
+        except Exception as e:
+            log.warning("could not restore the Office setting %s=%r: %s", name, value, com_error_text(e))
+
+
+def run_job(app_key: str, app, path: str, settings=()) -> str:
+    """Extract one file with ``settings`` in force for this job only.
+
+    Used for instances the user can see: the user's own values come back as
+    soon as the file is closed, even when extraction fails.
+    """
+    previous = apply_settings(app, settings) if settings else []
+    try:
+        return _EXTRACT[app_key](app, path)
+    finally:
+        restore_settings(app, previous)
+
+
+# --------------------------------------------------------------------------
 # per-application extraction (runs inside the worker thread)
 # --------------------------------------------------------------------------
-def _configure(app_key: str, app) -> None:
-    def attempt(fn):
-        try:
-            fn()
-        except Exception:
-            pass
+def looks_like_pdf_source(text: str) -> bool:
+    """Word loads a PDF its converter cannot read (DRM-protected, damaged) as plain text.
 
-    if app_key == "word":
-        attempt(lambda: setattr(app, "Visible", False))
-        attempt(lambda: setattr(app, "DisplayAlerts", 0))  # wdAlertsNone
-        attempt(lambda: setattr(app, "ScreenUpdating", False))
-    elif app_key == "excel":
-        attempt(lambda: setattr(app, "Visible", False))
-        attempt(lambda: setattr(app, "DisplayAlerts", False))
-        attempt(lambda: setattr(app, "ScreenUpdating", False))
-        attempt(lambda: setattr(app, "EnableEvents", False))
-    elif app_key == "powerpoint":
-        attempt(lambda: setattr(app, "DisplayAlerts", 1))  # ppAlertsNone
-    # msoAutomationSecurityForceDisable: never run macros in opened files.
-    attempt(lambda: setattr(app, "AutomationSecurity", 3))
+    The "text" is then the PDF syntax itself, possibly after a DRM header, so the
+    object keywords are checked as well as the "%PDF-" start.
+    """
+    if text.lstrip("\ufeff \t\r\n").startswith("%PDF-"):
+        return True
+    return text.count("endobj") >= 2 and "startxref" in text
 
 
 def _clean_word(text: str, tables_converted: bool) -> str:
@@ -176,7 +229,11 @@ def word_text(app, path: str) -> str:
         text = doc.Content.Text
     finally:
         doc.Close(SaveChanges=0)  # wdDoNotSaveChanges
-    return _clean_word(text, converted)
+    text = _clean_word(text, converted)
+    if looks_like_pdf_source(text):
+        raise ComError("Word could not convert this PDF and returned its raw PDF source as plain text "
+                       "(usual for DRM-protected PDFs)")
+    return text
 
 
 def excel_text(app, path: str, max_cells: int = MAX_CELLS) -> str:
@@ -337,6 +394,22 @@ class _PdfPromptOverride:
 # --------------------------------------------------------------------------
 # worker thread + manager
 # --------------------------------------------------------------------------
+def _user_joined(app_key: str, app) -> bool:
+    """True when the user opened presentations in the PowerPoint instance worklog started.
+
+    Every job closes its own presentation, so any left open are the user's: Quit() would close them.
+    """
+    if app_key != "powerpoint":
+        return False
+    try:
+        count = app.Presentations.Count
+    except Exception:
+        return False
+    if count:
+        log.info("PowerPoint now has %d presentation(s) of the user open; leaving it running", count)
+    return bool(count)
+
+
 class _AppWorker(threading.Thread):
     def __init__(self, app_key: str):
         super().__init__(daemon=True, name=f"worklog-com-{app_key}")
@@ -348,6 +421,7 @@ class _AppWorker(threading.Thread):
         self.before: set[int] = set()
         self.pid: int | None = None
         self.owned = False  # True when we started the process ourselves
+        self.job_settings: list[tuple[str, object]] = []  # applied around each job, then restored
         self.version = ""
 
     def run(self) -> None:
@@ -360,7 +434,6 @@ class _AppWorker(threading.Thread):
             exe = EXES[self.app_key]
             self.before = list_pids(exe)
             app = win32com.client.DispatchEx(PROGIDS[self.app_key])
-            _configure(self.app_key, app)
             self.pid = _hwnd_pid(self.app_key, app)
             if self.pid is None:
                 new = list_pids(exe) - self.before
@@ -370,6 +443,13 @@ class _AppWorker(threading.Thread):
                 self.owned = self.pid not in self.before
             else:
                 self.owned = not self.before
+            # A private hidden instance is configured once. A shared one gets worklog's settings
+            # only while a job runs. PowerPoint counts as shared even when worklog started it:
+            # it is single-instance, so presentations the user opens meanwhile land in it.
+            if self.owned and self.app_key != "powerpoint":
+                apply_settings(app, app_settings(self.app_key, shared=False))
+            else:
+                self.job_settings = app_settings(self.app_key, shared=not self.owned)
             try:
                 self.version = str(app.Version)
             except Exception:
@@ -387,11 +467,11 @@ class _AppWorker(threading.Thread):
                     break
                 job_id, path = job
                 try:
-                    self.results.put((job_id, _EXTRACT[self.app_key](app, path), None))
+                    self.results.put((job_id, run_job(self.app_key, app, path, self.job_settings), None))
                 except Exception as e:
                     self.results.put((job_id, None, com_error_text(e)))
         finally:
-            if self.owned:
+            if self.owned and not _user_joined(self.app_key, app):
                 try:
                     app.Quit()
                 except Exception:

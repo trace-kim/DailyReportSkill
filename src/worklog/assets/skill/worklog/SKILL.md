@@ -45,12 +45,14 @@ Tools (opencode lists them as `worklog_<name>`):
 5. If you learned what a folder is for, update the folder map (`folder_map_save`, one short line per folder, keep existing lines).
 6. Reply briefly in Korean: which days were written and their main items.
 
+Unattended runs (a scheduled prompt, `opencode run`): nobody is there to answer. Never ask questions or wait for confirmation; decide, lower `confidence` where unsure, and finish. A run that ends without calling `daily_save` writes nothing.
+
 Daily item fields:
 - `topic_id`
 - `summary`: one line, 개조식/명사형, e.g. "A사 제안서 3장 신규 작성 및 예산 단가 수정"
 - `details`: concrete facts (section/sheet/slide, numbers before → after, counts, dates)
 - `files`: relative paths
-- `context`: link to earlier work; mark inferences with "~로 보임"
+- `context`: link to earlier work the evidence shows; mark inferences with "~로 보임". Leave it out rather than guess a reason or cause
 - `status`: started | in_progress | reviewing | done | on_hold
 - `confidence`: `high` clear from content · `medium` partly inferred · `low` file names only
 
@@ -84,8 +86,9 @@ Statuses: `started` 착수하였습니다 · `in_progress` 진행중입니다 ·
 
 - Exactly one paragraph per topic: no line breaks, bullets, numbering or markdown.
 - 존댓말 보고체: every sentence ends with "~니다.", e.g. "~하였습니다.", "~진행하였습니다.", "~예정입니다.", "~중입니다.". Never "~함.", "~임.", "~했다.", "~해요.".
-- 3-6 sentences in this order: 배경/목적 → 이번 기간 수행 내용 (산출물, 수치, 날짜) → 현재 상태 → 향후 계획.
-- Facts only from daily logs and notes. Leave out what you would have to guess.
+- 2-6 sentences, in this order where the evidence covers it: 배경/목적 → 이번 기간 수행 내용 (산출물, 수치, 날짜) → 현재 상태 → 향후 계획.
+- Only 수행 내용 and 현재 상태 are required. Write 배경/목적, causes and 향후 계획 only when a daily log, a note or a document states them (a schedule, a deadline, an agreed next step). Never invent a plan, a reason or a cause: a paragraph without a 향후 계획 sentence is normal.
+- Facts only from daily logs and notes. Daily-log inferences ("~로 보임") are not facts: leave them out or keep them hedged. Leave out what you would have to guess.
 - Name documents by what they are ("A사 제안서", "3분기 실적 분석 자료"), not by file path.
 - Dates as "11월 4일", amounts as "1,350만 원", percentages as "12.5%".
 - Do not repeat the title sentence inside the paragraph.
@@ -93,7 +96,7 @@ Statuses: `started` 착수하였습니다 · `in_progress` 진행중입니다 ·
 ```json
 {"period_from": "2026-11-02", "period_to": "2026-11-13",
  "topics": [{"topic_ids": ["T003"], "subject": "A사 제안서 작성", "status": "in_progress",
-             "paragraph": "10월 28일 착수한 A사 제안서 초안 작성을 이어서 진행하였습니다. 10월 30일 회의에서 제기된 요구사항을 반영하여 추진 일정(3장)을 신규로 작성하였고, 인건비 단가를 1,200만 원에서 1,350만 원으로 조정하였습니다. 현재 전체 5개 장 중 4개 장의 작성을 완료하였으며, 다음 주 중 기술 부문 작성 후 내부 검토를 진행할 예정입니다."}]}
+             "paragraph": "10월 28일 착수한 A사 제안서 초안 작성을 이어서 진행하였습니다. 10월 30일 회의에서 제기된 요구사항을 반영하여 추진 일정(3장)을 신규로 작성하였고, 인건비 단가를 1,200만 원에서 1,350만 원으로 조정하였습니다. 현재 전체 5개 장 중 4개 장의 작성을 완료하였습니다."}]}
 ```
 
 Rendered:
@@ -109,7 +112,7 @@ Rendered:
 
 - A topic is one stream of work a manager would recognize: a project, a deliverable, a recurring duty. Its ID (`T001`, ...) is reused across days and weeks.
 - `name`: a specific Korean noun phrase such as "A사 제안서 작성", "3분기 실적 분석", "신규 입사자 교육 자료 준비". Avoid vague names like "문서 작업".
-- `paths`: folder prefixes that belong to the topic; they help match future changes.
+- `paths`: subfolders or files (relative to the work folder) that belong to the topic, e.g. `프로젝트/A사`; they help match future changes. For files directly in the work folder, list the files: `.` is the whole work folder and matches every file.
 - Keep `status` current (`topic_upsert(topic_id=..., status=...)`). `weekly_save` records the reported status automatically.
 
 ## Notes

@@ -6,7 +6,8 @@ reports for a senior manager (주간 업무 보고)** from those changes.
 
 - No git required: worklog keeps its own change index.
 - Works with DRM-protected Office files: when a file cannot be parsed directly, it is read
-  through Word / Excel / PowerPoint (COM automation).
+  through Word / Excel / PowerPoint (COM automation). DRM-protected PDFs are the exception: Word
+  cannot convert them, so they are tracked by name only.
 - Changes made by the user and by agents are tracked the same way.
 - The tool records facts (what changed, when, the diff, the document text) and checks report
   formats. The agent does the understanding and the writing.
@@ -55,20 +56,29 @@ Example weekly output (`.worklog/reports/weekly/2026-11-02_2026-11-13.txt`):
 Requirements: Python 3.10+; Microsoft Office for DRM-protected files; opencode for automatic daily logs.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Root "D:\업무"
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Root "D:\업무" -Model "provider/model"
 ```
+
+`-Model` is the model of the unattended daily-report run (`opencode models` lists them). Without
+it, `opencode run` uses the model last picked in the opencode TUI.
 
 The installer:
 - creates a virtual environment in `%LOCALAPPDATA%\worklog\venv` and installs worklog into it
 - initializes the work folder (`.worklog\`, hidden)
-- registers the MCP server, the skill and the two commands in `~/.config/opencode`
+- registers the MCP server, the skill and the two commands in `~/.config/opencode` (with
+  `-Workspace`: in the work folder, for DS Cowork; see below)
 - registers two scheduled tasks that run only while the user is logged on (Office automation and
   DRM clients need the user's session)
 - starts the baseline text extraction in the background
 
 Options: `-Wheelhouse <dir>` for offline PCs (build it with `python -m pip wheel . -w wheelhouse`
 on a PC with internet access and the same Python version), `-Report none` to skip the automatic agent
-run, `-MorningTime 08:30`, `-NoSchedule`, `-NoOpencode`, `-Uninstall`.
+run, `-Workspace`, `-MorningTime 08:30`, `-NoSchedule`, `-NoOpencode`, `-Uninstall`.
+
+`worklog morning` checks the agent's work instead of trusting its exit code (opencode exits 0 even
+when the model called no tool). If days are still without a log afterwards, the run fails (task
+result 1), `.worklog\logs\worklog.log` gets a warning with the end of the agent's output, and
+`status` shows a hint until those days are written.
 
 **Then check DRM readability on the target PC:**
 
@@ -87,11 +97,30 @@ that takes, whether the session is interactive, and whether files that Python wr
 stay readable (some DRM clients encrypt every new file). To test the scheduled-task context too,
 run the same command from a one-off task with `--out C:\temp\doctor.json`.
 
+### DS Cowork
+
+DS Cowork bundles its own opencode, which does not read `~/.config/opencode` and rewrites its own
+config dir on every start. It reads the folder it opens as its workspace, so register worklog there:
+
+```powershell
+worklog setup-opencode --root "D:\업무" --workspace   # or install.ps1 -Workspace
+```
+
+This writes `opencode.jsonc` (`mcp` entry), `.opencode\skills\worklog\SKILL.md` and
+`.opencode\commands\*.md` into the work folder (none of them is tracked as work). Reload the
+workspace in DS Cowork afterwards. `--workspace <DIR>` registers a different workspace folder.
+
+The bundled opencode is not on PATH and needs the app's login, so on a PC with only DS Cowork the
+morning task cannot start it: install with `-Workspace -Report none` and schedule the daily report
+in DS Cowork's own scheduler with a plain-text prompt (see [docs/TESTING.md](docs/TESTING.md),
+step 6). The morning task still closes out the changes; days the in-app scheduler misses while the
+app is closed are written by its next run.
+
 ### Other agents
 
-The company agent wraps opencode, so the opencode registration covers it. For any other MCP client,
-use the server command `<venv>\Scripts\python.exe -m worklog mcp --root "<folder>"`, and copy the
-skill and command files with `worklog export-assets <dir>`.
+For any other MCP client, use the server command
+`<venv>\Scripts\python.exe -m worklog mcp --root "<folder>"`, and copy the skill and command files
+with `worklog export-assets <dir>`.
 
 ## Using it
 
@@ -123,7 +152,8 @@ Everything lives in `<folder>\.worklog\`:
 worklog never modifies the user's files. Office files are opened read-only, with macros, link updates
 and alerts disabled, and closed without saving. Word and Excel run as separate hidden instances.
 PowerPoint is single-instance, so if the user already has it open it is shared and never closed or
-killed. While worklog's own Word instance runs with PDF support enabled, Word's PDF-conversion prompt
+killed; its alert and macro settings are changed only while a file is read and restored right after.
+While worklog's own Word instance runs with PDF support enabled, Word's PDF-conversion prompt
 is suppressed through a per-user registry value; the previous value is restored afterwards.
 
 Document content goes to whatever LLM provider the agent is configured with.

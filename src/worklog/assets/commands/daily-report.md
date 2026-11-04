@@ -11,5 +11,5 @@ Arguments: "$ARGUMENTS"
 Essentials:
 1. `status`; if changes are pending, call `close` until `remaining` is 0.
 2. For each day: `changes` and `notes_get` → set noise aside (`excluded`) → `diff` the meaningful changes → context from `read_file`, `related` and earlier logs → one item per topic (`topic_upsert` for new topics) → `daily_save`, fixing errors until it succeeds.
-3. Never modify the user's files. Never invent work the evidence does not show; lower `confidence` when you infer.
+3. Never modify the user's files. Never invent work the evidence does not show; lower `confidence` when you infer. In an unattended run, do not ask questions: decide and finish.
 4. Finish with a short Korean summary of what was written, or one line saying nothing needed writing.

@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 from pathlib import Path
 
 from conftest import backdate_tracking, set_mtime
@@ -28,6 +29,32 @@ def test_topics(make_wl):
     assert wl.topic_upsert(topic_id="T001", status="nonsense")["ok"] is False
     assert wl.topic_upsert(topic_id="T001", status="reviewing")["topic"]["status"] == "reviewing"
     assert wl.topic_upsert(name="교육 자료 준비")["topic"]["id"] == "T002"
+
+
+def test_topic_paths_are_normalized_and_matched(root: Path, make_wl):
+    (root / "A사").mkdir()
+    (root / "A사" / "제안서.txt").write_text("x", encoding="utf-8")
+    (root / "메모.txt").write_text("x", encoding="utf-8")
+    wl = make_wl()
+    r = wl.topic_upsert(name="A사 제안서 작성", paths=["./A사/", str(root / "메모.txt")])
+    assert r["topic"]["paths"] == ["A사", "메모.txt"] and "warnings" not in r
+    assert wl.topic_upsert(name="외부", paths=["../other"])["ok"] is False
+    # "." (what overview/changes call the work folder itself) covers every file, with a nudge.
+    r = wl.topic_upsert(name="전체 업무", paths=["."])
+    assert r["topic"]["paths"] == ["."] and r["warnings"]
+    assert {t["id"] for t in wl.related("A사/제안서.txt")["topics_for_path"]} == {"T001", "T002"}
+    assert {t["id"] for t in wl.related("메모.txt")["topics_for_path"]} == {"T001", "T002"}
+
+
+def test_related_reads_topic_paths_saved_by_older_versions(root: Path, make_wl):
+    (root / "A사").mkdir()
+    (root / "A사" / "제안서.txt").write_text("x", encoding="utf-8")
+    wl = make_wl()
+    wl.topic_upsert(name="A사 제안서 작성")
+    data = json.loads(wl.ws.topics_path.read_text(encoding="utf-8"))
+    data["topics"]["T001"]["paths"] = ["./a사/"]  # hand-edited: "./" prefix, other case, trailing slash
+    wl.ws.topics_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    assert [t["id"] for t in wl.related("A사/제안서.txt")["topics_for_path"]] == ["T001"]
 
 
 def test_daily_save_validation_and_render(root: Path, make_wl):

@@ -1,4 +1,12 @@
-"""Register worklog with opencode: MCP server entry, skill and slash commands."""
+"""Register worklog with opencode: MCP server entry, skill and slash commands.
+
+Two scopes:
+
+* global: the opencode config dir (``~/.config/opencode`` or ``$OPENCODE_CONFIG_DIR``).
+* workspace: one project folder, as ``<ws>/opencode.jsonc`` plus ``<ws>/.opencode/skills`` and
+  ``<ws>/.opencode/commands``. DS Cowork reads only this scope: its bundled opencode uses a
+  config dir of its own (``~/.openwork/...``) that the app rewrites on every start.
+"""
 
 from __future__ import annotations
 
@@ -13,11 +21,22 @@ from pathlib import Path
 
 SKILL_NAME = "worklog"
 COMMANDS = ("daily-report.md", "weekly-report.md")
+SCHEMA_URL = "https://opencode.ai/config.json"
 
 
 def opencode_config_dir() -> Path:
     env = os.environ.get("OPENCODE_CONFIG_DIR")
     return Path(env) if env else Path.home() / ".config" / "opencode"
+
+
+def default_backup_dir() -> Path:
+    """Where backups of rewritten opencode configs go.
+
+    Outside every work folder on purpose: a backup next to a workspace config
+    would be tracked as a work file.
+    """
+    base = os.environ.get("LOCALAPPDATA")
+    return (Path(base) if base else Path.home() / ".local" / "share") / "worklog" / "backups"
 
 
 def asset_text(*parts: str) -> str:
@@ -66,18 +85,32 @@ def python_for_mcp() -> str:
     return str(exe)
 
 
-def export_assets(dest: Path) -> list[str]:
+def _asset_paths(dest: Path) -> tuple[Path, list[Path]]:
+    return dest / "skills" / SKILL_NAME / "SKILL.md", [dest / "commands" / name for name in COMMANDS]
+
+
+def _write_assets(dest: Path, skill: bool = True, commands: bool = True) -> list[str]:
+    skill_path, cmd_paths = _asset_paths(dest)
+    jobs = ([(skill_path, ("skill", SKILL_NAME, "SKILL.md"))] if skill else []) + (
+        [(p, ("commands", name)) for name, p in zip(COMMANDS, cmd_paths)] if commands else [])
     written = []
-    skill = dest / "skills" / SKILL_NAME / "SKILL.md"
-    skill.parent.mkdir(parents=True, exist_ok=True)
-    skill.write_text(asset_text("skill", SKILL_NAME, "SKILL.md"), encoding="utf-8")
-    written.append(str(skill))
-    for name in COMMANDS:
-        p = dest / "commands" / name
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(asset_text("commands", name), encoding="utf-8")
-        written.append(str(p))
+    for path, parts in jobs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(asset_text(*parts), encoding="utf-8")
+        written.append(str(path))
     return written
+
+
+def export_assets(dest: Path) -> list[str]:
+    return _write_assets(dest)
+
+
+def _backup(config_path: Path, backup_dir: Path) -> Path:
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    label = config_path.parent.name or "root"
+    backup = backup_dir / f"{label}_{config_path.name}.{dt.datetime.now():%Y%m%d-%H%M%S}.bak"
+    shutil.copy2(config_path, backup)
+    return backup
 
 
 def setup_opencode(
@@ -88,13 +121,28 @@ def setup_opencode(
     install_commands: bool = True,
     remove: bool = False,
     timeout_ms: int = 120_000,
+    workspace: Path | None = None,
+    backup_dir: Path | None = None,
 ) -> dict:
-    base = opencode_config_dir()
+    """Add (or with ``remove`` take out) the MCP entry, the skill and the commands.
+
+    ``workspace`` switches from the global config dir to that folder. The config
+    is only rewritten when its content changes, and a backup of the old file
+    goes to ``backup_dir`` (default: :func:`default_backup_dir`).
+    """
+    if workspace is not None:
+        config_dir = Path(workspace).expanduser().resolve()
+        assets_dir, default_name = config_dir / ".opencode", "opencode.jsonc"
+    else:
+        config_dir = assets_dir = opencode_config_dir()
+        default_name = "opencode.json"
     if config_path is None:
-        config_path = next(
-            (p for p in (base / "opencode.jsonc", base / "opencode.json") if p.exists()), base / "opencode.json"
-        )
-    result: dict = {"config": str(config_path), "warnings": []}
+        config_path = next((p for p in (config_dir / "opencode.jsonc", config_dir / "opencode.json") if p.exists()),
+                           config_dir / default_name)
+    result: dict = {"scope": "workspace" if workspace is not None else "global",
+                    "config": str(config_path), "warnings": []}
+
+    raw: str | None = None
     data: dict = {}
     if config_path.exists():
         raw = config_path.read_text(encoding="utf-8-sig")
@@ -103,16 +151,11 @@ def setup_opencode(
         except json.JSONDecodeError:
             data = json.loads(strip_jsonc(raw))
             result["warnings"].append("the config had comments; they were removed (a backup was kept)")
-        backup = config_path.with_name(f"{config_path.name}.bak-{dt.datetime.now():%Y%m%d%H%M%S}")
-        shutil.copy2(config_path, backup)
-        result["backup"] = str(backup)
     if not isinstance(data, dict):
         raise ValueError(f"{config_path} does not contain a JSON object")
 
-    mcp = data.setdefault("mcp", {})
-    if remove:
-        mcp.pop("worklog", None)
-    else:
+    if not remove:
+        mcp = data.setdefault("mcp", {})
         mcp["worklog"] = {
             "type": "local",
             "command": [python_exe or python_for_mcp(), "-m", "worklog", "mcp", "--root", str(Path(root).resolve())],
@@ -120,31 +163,43 @@ def setup_opencode(
             "timeout": int(timeout_ms),
         }
         result["mcp"] = mcp["worklog"]
-    if "$schema" not in data:
-        data = {"$schema": "https://opencode.ai/config.json", **data}
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        if "$schema" not in data:
+            data = {"$schema": SCHEMA_URL, **data}
+    elif isinstance(data.get("mcp"), dict):
+        data["mcp"].pop("worklog", None)
+    if raw is not None or not remove:  # removing from a missing config: nothing to write
+        text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        if text == raw:
+            result["unchanged"] = True
+        else:
+            if raw is not None:
+                result["backup"] = str(_backup(config_path, backup_dir or default_backup_dir()))
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(text, encoding="utf-8")
 
     files: list[str] = []
-    skill_path = base / "skills" / SKILL_NAME / "SKILL.md"
-    cmd_paths = [base / "commands" / name for name in COMMANDS]
     if remove:
+        skill_path, cmd_paths = _asset_paths(assets_dir)
         for p in [skill_path, *cmd_paths]:
             if p.exists():
                 p.unlink()
                 files.append(f"removed {p}")
-        if skill_path.parent.exists() and not any(skill_path.parent.iterdir()):
-            skill_path.parent.rmdir()
+        prune = [skill_path.parent]
+        if workspace is not None:  # also drop the .opencode folders if nothing else uses them
+            prune += [skill_path.parent.parent, cmd_paths[0].parent, assets_dir]
+        for d in prune:
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
     else:
-        if install_skill:
-            skill_path.parent.mkdir(parents=True, exist_ok=True)
-            skill_path.write_text(asset_text("skill", SKILL_NAME, "SKILL.md"), encoding="utf-8")
-            files.append(str(skill_path))
-        if install_commands:
-            for name, p in zip(COMMANDS, cmd_paths):
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(asset_text("commands", name), encoding="utf-8")
-                files.append(str(p))
+        files = _write_assets(assets_dir, install_skill, install_commands)
+        if workspace is not None:
+            result["next"] = ("Reload the workspace in DS Cowork (or restart opencode in that folder) "
+                              "so it loads the worklog MCP server, skill and commands.")
+        elif (Path.home() / ".openwork").is_dir():
+            result["warnings"].append(
+                "DS Cowork is installed: it does not read this global config (its bundled opencode uses "
+                "~/.openwork/... and rewrites it on every start). For DS Cowork, run setup-opencode "
+                "--workspace in the folder it opens as its workspace.")
     result["files"] = files
     result["ok"] = True
     return result

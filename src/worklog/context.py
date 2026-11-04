@@ -32,6 +32,19 @@ def _parent(path: str) -> str:
     return path.rsplit("/", 1)[0] if "/" in path else ""
 
 
+def covers(prefix: str, rel: str) -> bool:
+    """Whether a topic path (folder prefix or file) covers ``rel``. "." is the whole work folder.
+
+    Tolerates values saved by hand or by older versions ("./A사", "A사\\", ".").
+    """
+    p = str(prefix).strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.strip("/").casefold()
+    r = rel.casefold()
+    return p in ("", ".") or r == p or r.startswith(p + "/")
+
+
 def _day(ts: float) -> str:
     return dt.datetime.fromtimestamp(ts).date().isoformat()
 
@@ -102,7 +115,7 @@ def related(wl: "Worklog", path: str, limit: int = 10) -> dict:
     topics = [
         {"id": t["id"], "name": t.get("name"), "status": t.get("status")}
         for t in wl.topics.list()
-        if any(rel == p or rel.startswith(p.rstrip("/") + "/") for p in t.get("paths", []))
+        if any(covers(p, rel) for p in t.get("paths", []))
     ]
     return {
         "path": rel,

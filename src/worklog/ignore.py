@@ -15,6 +15,7 @@ DEFAULT_IGNORE = [
     ".agents/",
     "opencode.json",
     "opencode.jsonc",
+    "opencode.json*.bak-*",  # config backups left by worklog 0.1.0 setup-opencode
     # version control / dev environments
     ".git/",
     ".svn/",
