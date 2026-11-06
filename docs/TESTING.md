@@ -50,7 +50,7 @@ Save open Office work first: the tests start hidden Word, Excel and PowerPoint i
 $env:WORKLOG_TEST_COM = "1"; python -m pytest -q; Remove-Item Env:WORKLOG_TEST_COM
 ```
 
-**Expected:** `65 passed`.
+**Expected:** `81 passed`.
 
 PowerPoint can only run once, so if it is already open the tests share it; they never close your
 presentations. If tests fail, keep the output: a failure here tells us something about this PC
@@ -139,8 +139,9 @@ worklog setup-opencode
 ```
 
 This adds a `worklog` MCP server for the test folder to
-`%USERPROFILE%\.config\opencode\opencode.json` and installs the skill and the `/daily-report` and
-`/weekly-report` commands in the same folder. If the file existed, a backup of it goes to
+`%USERPROFILE%\.config\opencode\opencode.json` and installs the skill and the commands
+(`/daily-report`, `/weekly-report`, `/worklog-init`, `/worklog-status`, `/worklog-doctor`) in the
+same folder. If the file existed, a backup of it goes to
 `%LOCALAPPDATA%\worklog\backups`. Restart opencode.
 
 ### 5b. DS Cowork
@@ -161,9 +162,10 @@ Cowork, open the test folder as the workspace and reload it.
 
 Type, one at a time:
 
-1. `/daily-report 오늘`: the agent reads the changes and saves today's daily log.
-2. `오늘 A사 미팅 다녀왔어`: the agent stores this as a note for today.
-3. `/weekly-report`: the agent writes a weekly report from the daily logs.
+1. `/worklog-status`: a short Korean summary (tracked files, pending changes, days that need a log).
+2. `/daily-report 오늘`: the agent reads the changes and saves today's daily log.
+3. `오늘 A사 미팅 다녀왔어`: the agent stores this as a note for today.
+4. `/weekly-report`: the agent writes a weekly report from the daily logs.
 
 Back in PowerShell, print what was saved:
 
@@ -176,6 +178,33 @@ worklog render weekly
 paragraph per topic, every sentence ending in `~니다.` With one day of data the weekly report is
 short; the format is what matters here. A 향후 계획 sentence should appear only where a log or
 note states a plan.
+
+### 5c. Start tracking from the agent, on a large folder
+
+This repeats the case that used to time out: an agent session on a large folder that worklog has
+never seen. Use the real work folder (worklog never changes files in it; what it creates here is
+kept by step 6) or any large folder without a `.worklog` inside:
+
+```powershell
+$big = "D:\업무"
+worklog setup-opencode --root $big --workspace     # DS Cowork; for 5a use: worklog setup-opencode --root $big
+```
+
+Open `$big` as the workspace (DS Cowork: open it and reload; opencode: start it in that folder),
+then type:
+
+1. `/worklog-init`. **Expected:** within a few minutes, a Korean answer with the number of
+   tracked files and the `doctor` verdicts, ending with a question whether to start reading the
+   existing files (the baseline). On a very large folder or a network drive the first inventory may
+   still be running; the agent says so and checks again.
+2. `네`. **Expected:** the baseline starts in the background, and the agent says whether it keeps
+   running after the session ends.
+3. `/worklog-status` a minute later. **Expected:** `baseline_remaining` is going down.
+4. `/daily-report 오늘`. **Expected:** it works while the baseline runs.
+
+Every tool call is logged with its duration in `$big\.worklog\logs\worklog.log`, for example
+`tool close: done in 3.2s`. No call should take much more than 30 seconds; if one does, send
+that log.
 
 ### Unattended run (5a only)
 
@@ -246,7 +275,9 @@ The installer:
 
 On a large DRM folder the background reading keeps hidden Word and Excel busy for a while. That
 is expected. The first run has no time limit; if it is cut short (logoff, reboot), the morning task
-continues it for up to 15 minutes per run until every file has been read once.
+continues it for up to 15 minutes per run until every file has been read once. Files not modified
+in the 180 days before tracking started are skipped (`baseline_max_age_days` in `config.toml`);
+they get their text when they next change.
 
 The next morning, the daily log for the previous workday should be in `.worklog\reports\daily\`
 inside the work folder, and the agent's output in `.worklog\logs\report-*.log` (opencode PCs). If
@@ -271,6 +302,13 @@ git pull
 The repo's `.venv` (editable) picks up changes by itself. The installed copy used by the scheduled
 tasks does not: the first `pip` line replaces it (needed while the version number stays the same),
 and the second installs any new dependencies. The `&` at the start of those lines is required.
+
+Then refresh the agent's skill and commands, and restart opencode or reload the DS Cowork workspace:
+
+```powershell
+& "$env:LOCALAPPDATA\worklog\venv\Scripts\worklog.exe" setup-opencode --root "D:\업무"              # opencode
+& "$env:LOCALAPPDATA\worklog\venv\Scripts\worklog.exe" setup-opencode --root "D:\업무" --workspace  # DS Cowork
+```
 
 ## What to send back
 

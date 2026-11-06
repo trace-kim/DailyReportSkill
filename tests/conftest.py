@@ -17,6 +17,12 @@ def write_config(root: Path, com: bool = False, extra: str = "") -> None:
     (d / "config.toml").write_text(text + extra, encoding="utf-8")
 
 
+@pytest.fixture(autouse=True)
+def _no_task_scheduler(monkeypatch):
+    """Tests do not depend on the Task Scheduler of the PC they run on."""
+    monkeypatch.setattr("worklog.service.find_scheduled_tasks", lambda root: None)
+
+
 @pytest.fixture
 def root(tmp_path: Path) -> Path:
     r = tmp_path / "업무 폴더"  # Korean name with a space on purpose

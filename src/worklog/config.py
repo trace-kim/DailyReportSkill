@@ -79,6 +79,17 @@ report_command = []
 report_timeout_min = 30
 # Minutes of baseline text extraction done by each `worklog morning` run.
 baseline_minutes_per_run = 15
+# Capture a baseline only for files modified in the last N days before tracking
+# started (0 = all files). Older files rarely change; if one does, its first change
+# shows the full content instead of a diff.
+baseline_max_age_days = 180
+
+[agent]
+# Time limit of one agent tool call (MCP), in seconds: a call starts no new work
+# after this and returns about 15 seconds later at the latest, below the agent's
+# tool-call timeout (often 60 s). Longer work continues over several calls or in
+# the background.
+call_seconds = 30
 """
 
 _HHMM = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*$")
@@ -122,6 +133,8 @@ class Config:
     report_command: list[str] = field(default_factory=list)
     report_timeout_min: float = 30
     baseline_minutes_per_run: float = 15
+    baseline_max_age_days: float = 180
+    agent_call_seconds: float = 30
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -157,6 +170,9 @@ class Config:
         cfg.report_command = [str(x) for x in cmd] if isinstance(cmd, list) else []
         cfg.report_timeout_min = float(a.get("report_timeout_min", cfg.report_timeout_min))
         cfg.baseline_minutes_per_run = float(a.get("baseline_minutes_per_run", cfg.baseline_minutes_per_run))
+        cfg.baseline_max_age_days = max(0.0, float(a.get("baseline_max_age_days", cfg.baseline_max_age_days)))
+        ag = data.get("agent", {})
+        cfg.agent_call_seconds = max(5.0, float(ag.get("call_seconds", cfg.agent_call_seconds)))
         return cfg
 
     # --- day arithmetic -------------------------------------------------

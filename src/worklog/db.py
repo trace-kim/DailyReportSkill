@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(
@@ -38,9 +38,10 @@ CREATE TABLE IF NOT EXISTS files(
 
 CREATE TABLE IF NOT EXISTS scans(
   id INTEGER PRIMARY KEY,
-  taken_at REAL NOT NULL,
+  taken_at REAL NOT NULL,            -- when the walk started
   n_files INTEGER,
-  n_events INTEGER
+  n_events INTEGER,
+  duration REAL                      -- seconds the walk took (schema 2)
 );
 
 CREATE TABLE IF NOT EXISTS scan_events(
@@ -90,16 +91,27 @@ CREATE INDEX IF NOT EXISTS ix_changes_path ON changes(path);
 """
 
 
-def connect(path: Path) -> sqlite3.Connection:
+def connect(path: Path, setup: bool = True) -> sqlite3.Connection:
+    """Open the index. ``setup=False`` skips schema creation and migration (for a second
+    connection used by a background thread, after the main one has set things up)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(path), timeout=30, check_same_thread=False)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
-    con.executescript(SCHEMA)
-    con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-    con.commit()
+    if setup:
+        con.executescript(SCHEMA)
+        _migrate(con)
+        con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        con.commit()
     return con
+
+
+def _migrate(con: sqlite3.Connection) -> None:
+    """Bring indexes created by older versions up to the current schema."""
+    cols = {r[1] for r in con.execute("PRAGMA table_info(scans)")}
+    if "duration" not in cols:
+        con.execute("ALTER TABLE scans ADD COLUMN duration REAL")
 
 
 def get_meta(con: sqlite3.Connection, key: str, default: str | None = None) -> str | None:

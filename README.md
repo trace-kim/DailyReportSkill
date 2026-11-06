@@ -21,7 +21,7 @@ Task Scheduler ─ hourly + at logon ─▶ worklogw scan       size/mtime only,
 
 opencode / company agent
  ├─ skill    worklog/SKILL.md          workflow + Korean writing rules
- ├─ commands /daily-report  /weekly-report
+ ├─ commands /daily-report  /weekly-report  /worklog-init  /worklog-status  /worklog-doctor
  └─ MCP      python -m worklog mcp --root <folder>
 ```
 
@@ -65,7 +65,7 @@ it, `opencode run` uses the model last picked in the opencode TUI.
 The installer:
 - creates a virtual environment in `%LOCALAPPDATA%\worklog\venv` and installs worklog into it
 - initializes the work folder (`.worklog\`, hidden)
-- registers the MCP server, the skill and the two commands in `~/.config/opencode` (with
+- registers the MCP server, the skill and the commands in `~/.config/opencode` (with
   `-Workspace`: in the work folder, for DS Cowork; see below)
 - registers two scheduled tasks that run only while the user is logged on (Office automation and
   DRM clients need the user's session)
@@ -109,6 +109,12 @@ worklog setup-opencode --root "D:\업무" --workspace   # or install.ps1 -Worksp
 This writes `opencode.jsonc` (`mcp` entry), `.opencode\skills\worklog\SKILL.md` and
 `.opencode\commands\*.md` into the work folder (none of them is tracked as work). Reload the
 workspace in DS Cowork afterwards. `--workspace <DIR>` registers a different workspace folder.
+Run it again after updating worklog, so the workspace gets the current commands.
+
+Tracking can then be started from DS Cowork itself: `/worklog-init` (or asking the agent to start
+tracking) calls the `init` tool, checks Office/DRM readability with `doctor` and offers to start the
+baseline. Nothing is written into the work folder before that. The scheduled tasks cannot be created
+from the agent: `status` says when they are missing, together with the `install.ps1` command to run.
 
 The bundled opencode is not on PATH and needs the app's login, so on a PC with only DS Cowork the
 morning task cannot start it: install with `-Workspace -Report none` and schedule the daily report
@@ -130,6 +136,19 @@ In opencode:
 - `/weekly-report`: from the day after the last weekly report up to the latest daily log.
   `/weekly-report 2026-11-02 2026-11-13` uses an explicit period.
 - Telling the agent about off-file work ("오늘 A사 미팅 다녀왔어") stores a note for that day's log.
+- `/worklog-init`: start tracking this folder (DS Cowork, or any agent without the installer).
+- `/worklog-status`: what is tracked, what is pending, which days need a log, background work.
+- `/worklog-doctor`: can the agent read the Office/PDF (DRM) files here; `/worklog-doctor 다시` reruns it.
+
+Agent tool calls are kept short, whatever the folder size: each returns within about 30 seconds
+(`[agent] call_seconds`), and work that takes longer moves to the background. The first inventory
+of a large folder and slow rescans continue after the call returns. `close` handles what fits and
+reports `remaining`. The baseline runs as a separate process for up to `minutes`. A tool that is
+still working on something else answers `busy` instead of queueing the call. The baseline steps aside
+whenever a close-out needs the index. It skips files untouched for more than
+`[automation] baseline_max_age_days` (180) before tracking started. Agent apps that end their
+servers' child processes with the session (the MCP Python SDK does) also end a background baseline:
+the `baseline` answer says so (`survives_session`), the progress is kept, and the next run continues.
 
 CLI (`worklog <command> --root <folder>`): `init`, `scan`, `close`, `baseline`, `morning`, `status`,
 `changes [DAY] [--diffs]`, `diff ID`, `read PATH`, `search TEXT`, `render daily|weekly [KEY]`, `doctor [PATHS]`,
@@ -141,7 +160,7 @@ Everything lives in `<folder>\.worklog\`:
 
 | Path | Content |
 |---|---|
-| `config.toml` | settings (day boundary, Office/COM, retention, report title, status phrases) |
+| `config.toml` | settings (day boundary, Office/COM, retention, agent call time, report title, status phrases) |
 | `index.db` | SQLite: tracked files, scans, change records |
 | `text\`, `diffs\` | latest text of each document and daily diffs, **DPAPI-encrypted** (only this Windows user on this PC can decrypt them); diffs are deleted after `diff_retention_days` (60) |
 | `topics.json` | work topics (safe to edit by hand) |

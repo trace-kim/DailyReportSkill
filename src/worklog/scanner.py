@@ -55,13 +55,16 @@ def walk(root: Path, rules: IgnoreRules, failed_dirs: list[str] | None = None) -
                     log.debug("skip %s: %s", entry.path, e)
 
 
-def scan(con: sqlite3.Connection, root: Path, rules: IgnoreRules, now: float | None = None) -> dict:
+def scan(con: sqlite3.Connection, root: Path, rules: IgnoreRules, now: float | None = None,
+         progress: dict | None = None) -> dict:
     """Compare the folder with the index and record added/modified/deleted events.
 
     The very first scan only records the baseline inventory (origin='init')
-    and no events.
+    and no events. ``progress["files"]`` is kept up to date during the walk, for
+    callers that report on a scan running in another thread.
     """
     now = time.time() if now is None else now
+    t0 = time.monotonic()
     if not root.is_dir():
         raise FileNotFoundError(f"work folder not found: {root}")
     initial = get_meta(con, "installed_at") is None
@@ -79,6 +82,8 @@ def scan(con: sqlite3.Connection, root: Path, rules: IgnoreRules, now: float | N
 
     for rel, size, mtime in walk(root, rules, failed_dirs):
         n_files += 1
+        if progress is not None and not n_files % 500:
+            progress["files"] = n_files
         seen.add(rel)
         cur = existing.get(rel)
         if cur is None:
@@ -102,6 +107,9 @@ def scan(con: sqlite3.Connection, root: Path, rules: IgnoreRules, now: float | N
     ]
     for _fid, rel, size, mtime in deletions:
         events.append((rel, "deleted", size, mtime))
+    if progress is not None:
+        progress["files"] = n_files
+    duration = time.monotonic() - t0
 
     with con:
         con.executemany(
@@ -114,8 +122,8 @@ def scan(con: sqlite3.Connection, root: Path, rules: IgnoreRules, now: float | N
         )
         con.executemany("UPDATE files SET present=0 WHERE id=?", [(d[0],) for d in deletions])
         cur = con.execute(
-            "INSERT INTO scans(taken_at, n_files, n_events) VALUES(?, ?, ?)",
-            (now, n_files, len(events)),
+            "INSERT INTO scans(taken_at, n_files, n_events, duration) VALUES(?, ?, ?, ?)",
+            (now, n_files, len(events), round(duration, 3)),
         )
         scan_id = cur.lastrowid
         con.executemany(
@@ -128,7 +136,7 @@ def scan(con: sqlite3.Connection, root: Path, rules: IgnoreRules, now: float | N
     counts = {"added": 0, "modified": 0, "deleted": 0}
     for _p, k, _s, _m in events:
         counts[k] += 1
-    out = {"scan_id": scan_id, "initial": initial, "files": n_files, **counts}
+    out = {"scan_id": scan_id, "initial": initial, "files": n_files, **counts, "seconds": round(duration, 1)}
     if failed_dirs:
         out["unreadable_folders"] = failed_dirs[:20]
     return out

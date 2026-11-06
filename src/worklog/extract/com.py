@@ -43,6 +43,13 @@ EXES = {"word": "WINWORD.EXE", "excel": "EXCEL.EXE", "powerpoint": "POWERPNT.EXE
 NO_PASSWORD = "worklog-no-password"
 MAX_CELLS = 300_000
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+# Waits are never cut below this, even when the caller's time is nearly up.
+MIN_WAIT_SEC = 5.0
+# Only a wait at least this long proves that Office hangs (rather than that the
+# caller's time ran out); only such failures trip the circuit breaker and are remembered.
+CONCLUSIVE_WAIT_SEC = 30.0
+# How long a remembered failure keeps an app from being started again (shared memory).
+UNAVAILABLE_TTL_SEC = 600.0
 
 
 class ComError(Exception):
@@ -481,9 +488,15 @@ class _AppWorker(threading.Thread):
 
 
 class OfficeCom:
-    """Runs extraction jobs on per-application worker threads with timeouts."""
+    """Runs extraction jobs on per-application worker threads with timeouts.
 
-    def __init__(self, timeout_sec: float = 90, start_timeout_sec: float = 60, pdf_via_word: bool = False):
+    ``memory`` (optional, shared between instances of one process, e.g. the MCP
+    server) remembers apps that failed to start or kept hanging, so the next calls
+    fail fast for a while instead of paying the full timeout again.
+    """
+
+    def __init__(self, timeout_sec: float = 90, start_timeout_sec: float = 60, pdf_via_word: bool = False,
+                 memory: dict | None = None):
         self.timeout = float(timeout_sec)
         self.start_timeout = float(start_timeout_sec)
         self._pdf_prompt = _PdfPromptOverride() if pdf_via_word else None
@@ -491,29 +504,41 @@ class OfficeCom:
         self._unavailable: dict[str, str] = {}
         self._timeouts: dict[str, int] = {}
         self._ids = itertools.count(1)
+        self.memory = memory
 
-    def _worker(self, app_key: str) -> _AppWorker:
+    def _mark_unavailable(self, app_key: str, msg: str, conclusive: bool = True) -> None:
+        self._unavailable[app_key] = msg
+        if conclusive and self.memory is not None:
+            self.memory[app_key] = (time.time() + UNAVAILABLE_TTL_SEC, msg, time.time())
+
+    def _worker(self, app_key: str, wait_limit: float | None = None) -> _AppWorker:
         if app_key in self._unavailable:
             raise ComUnavailable(self._unavailable[app_key])
+        remembered = self.memory.get(app_key) if self.memory is not None else None
+        if remembered and remembered[0] > time.time():
+            until, msg, at = remembered
+            raise ComUnavailable(f"{msg} (at {time.strftime('%H:%M', time.localtime(at))}; worklog tries "
+                                 f"Office again after {time.strftime('%H:%M', time.localtime(until))})")
         w = self._workers.get(app_key)
         if w is not None and w.is_alive():
             return w
         if app_key == "word" and self._pdf_prompt is not None:
             self._pdf_prompt.apply()  # must be in place before Word starts
+        wait = self.start_timeout if wait_limit is None else max(MIN_WAIT_SEC, min(self.start_timeout, wait_limit))
         w = _AppWorker(app_key)
         w.start()
-        if not w.ready.wait(self.start_timeout):
+        if not w.ready.wait(wait):
             # Probably stuck on a first-run/activation dialog. Kill the
             # instance only if exactly one new process appeared (ours).
             new = list_pids(EXES[app_key]) - w.before
             if len(new) == 1:
                 kill_pid(new.pop())
-            msg = f"{PROGIDS[app_key]} did not start within {self.start_timeout:.0f}s"
-            self._unavailable[app_key] = msg
+            msg = f"{PROGIDS[app_key]} did not start within {wait:.0f}s"
+            self._mark_unavailable(app_key, msg, conclusive=wait >= CONCLUSIVE_WAIT_SEC)
             raise ComTimeout(msg)
         if w.start_error:
             msg = f"cannot start {PROGIDS[app_key]}: {w.start_error}"
-            self._unavailable[app_key] = msg
+            self._mark_unavailable(app_key, msg)
             raise ComUnavailable(msg)
         self._workers[app_key] = w
         return w
@@ -522,21 +547,30 @@ class OfficeCom:
         w = self._worker(app_key)
         return {"app": PROGIDS[app_key], "version": w.version, "pid": w.pid, "owned": w.owned}
 
-    def extract(self, app_key: str, path: Path) -> str:
-        w = self._worker(app_key)
+    def extract(self, app_key: str, path: Path, timeout: float | None = None) -> str:
+        """Extract one file. ``timeout`` caps the whole wait (start + job) below the
+        configured timeout, for callers that must return in time (agent calls)."""
+        limit = self.timeout if timeout is None else max(MIN_WAIT_SEC, min(self.timeout, timeout))
+        capped = limit < self.timeout
+        t_start = time.monotonic()
+        w = self._worker(app_key, wait_limit=None if timeout is None else limit)
         job_id = next(self._ids)
         w.jobs.put((job_id, str(Path(path).resolve())))
-        deadline = time.monotonic() + self.timeout
+        t_job = time.monotonic()
+        deadline = max(t_start + limit, t_job + MIN_WAIT_SEC)
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                waited = time.monotonic() - t_job
                 self._abandon(app_key)
                 # Circuit breaker: if Office keeps hanging (e.g. the DRM client
                 # waits for a login), stop paying the timeout for every file.
-                self._timeouts[app_key] = self._timeouts.get(app_key, 0) + 1
-                if self._timeouts[app_key] >= 3:
-                    self._unavailable[app_key] = f"{PROGIDS[app_key]} timed out 3 times in a row"
-                raise ComTimeout(f"{PROGIDS[app_key]} did not finish within {self.timeout:.0f}s")
+                if waited >= min(self.timeout, CONCLUSIVE_WAIT_SEC):
+                    self._timeouts[app_key] = self._timeouts.get(app_key, 0) + 1
+                    if self._timeouts[app_key] >= 3:
+                        self._mark_unavailable(app_key, f"{PROGIDS[app_key]} timed out 3 times in a row")
+                note = " (the time limit of this agent call; a later close-out retries it)" if capped else ""
+                raise ComTimeout(f"{PROGIDS[app_key]} did not finish within {waited:.0f}s{note}")
             try:
                 jid, text, err = w.results.get(timeout=min(remaining, 1.0))
             except queue.Empty:
@@ -544,6 +578,8 @@ class OfficeCom:
             if jid != job_id:  # stale result of an abandoned job
                 continue
             self._timeouts[app_key] = 0
+            if self.memory is not None:
+                self.memory.pop(app_key, None)
             if err:
                 raise ComError(err)
             return text
@@ -558,11 +594,14 @@ class OfficeCom:
             log.warning("%s is shared with the user; abandoning without killing", PROGIDS[app_key])
         w.jobs.put(None)
 
-    def shutdown(self) -> None:
+    def shutdown(self, wait: float = 30) -> None:
+        """Quit the instances worklog started. ``wait`` bounds the wait per app; an owned
+        instance that has not quit by then is killed, a shared one is left alone. After a
+        short wait a slow PowerPoint is left to quit on its own: the user may be in it."""
         for key, w in list(self._workers.items()):
             w.jobs.put(None)
-            w.join(timeout=30)
-            if w.is_alive() and w.owned and w.pid:
+            w.join(timeout=wait)
+            if w.is_alive() and w.owned and w.pid and (key != "powerpoint" or wait >= CONCLUSIVE_WAIT_SEC):
                 kill_pid(w.pid)
         self._workers.clear()
         if self._pdf_prompt is not None:

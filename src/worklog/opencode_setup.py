@@ -20,7 +20,7 @@ from importlib import resources
 from pathlib import Path
 
 SKILL_NAME = "worklog"
-COMMANDS = ("daily-report.md", "weekly-report.md")
+COMMANDS = ("daily-report.md", "weekly-report.md", "worklog-init.md", "worklog-status.md", "worklog-doctor.md")
 SCHEMA_URL = "https://opencode.ai/config.json"
 
 

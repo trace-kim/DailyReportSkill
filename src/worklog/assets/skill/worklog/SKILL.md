@@ -16,8 +16,11 @@ Tools (opencode lists them as `worklog_<name>`):
 
 | Tool | Use |
 |---|---|
-| `status` | Start here: pending close-out, days needing a log, next weekly period, active topics, hints |
+| `status` | Start here: whether tracking has started, pending close-out, days needing a log, next weekly period, active topics, background work, hints |
+| `init` | Start tracking a folder (first use only; see Setup) |
 | `close` | Extract text and record diffs; repeat while `remaining` > 0 |
+| `doctor` | Check which document types can be read (directly, through Office, not at all) |
+| `baseline` | Start the one-time baseline in the background (only when the user asks) |
 | `changes(day)` | The change list of one day |
 | `diff(change_id)` | What changed in one file |
 | `read_file(path)` | Current text of a document (works for DRM files) |
@@ -29,9 +32,17 @@ Tools (opencode lists them as `worklog_<name>`):
 | `daily_save`, `weekly_save` | Validate and save reports; fix the returned errors and retry |
 | `reports_list`, `report_get`, `render` | Read saved reports |
 
+## Setup, busy answers and background work
+
+- `status.initialized` is false: tracking has not started. Call `init`. It lists the files in the background (names, sizes, dates; nothing is opened) as the starting point. While the inventory runs, `status` says so; call it again a little later. A folder that was just initialized has no changes yet, so there is nothing to report until files change.
+- Every tool call is time-limited so that it answers before the agent's timeout. An answer with `"busy": true` means earlier work is still running (a long folder scan, an earlier call, a close-out in another process): call the same tool again. After about 5 busy answers in a row, stop and tell the user what is still running.
+- Never wait for the baseline. `baseline_remaining` > 0 only means that some files' first change will show their whole content (`no_baseline`). The morning task continues it; `baseline` starts it in the background, but only when the user asks for it (it keeps hidden Word/Excel busy). It steps aside while `close` runs, so go on working. Its answer says whether it stops when this session ends (`survives_session`); if the `message` says so, pass that on to the user in one sentence.
+- `doctor` checks which document types can be read. Use it during setup (`/worklog-init`), when the user asks, or when many extractions fail. It runs in the background: call it again until it returns `verdicts`.
+- `scheduled_tasks` is empty: the hourly scan and the morning close-out are not installed. Tell the user once, with the install command from the hint.
+
 ## Daily work log (일일 업무 일지)
 
-1. `status`. If `pending_close.changed` > 0, call `close` until `remaining` is 0 (each call is time-limited).
+1. `status`. If `initialized` is false, follow Setup above and stop. If `pending_close.changed` > 0, call `close` until `remaining` is 0 (each call is time-limited).
 2. Choose days. A date from the user/arguments wins (for today: close first; today's log can be rewritten later). Otherwise every day in `days_needing_report`, oldest first. If none, say so and stop.
 3. Load context once: `topics_list`, `folder_map_get`, and the last ~5 daily logs (`reports_list`, then `report_get`).
 4. For each day:
@@ -45,7 +56,7 @@ Tools (opencode lists them as `worklog_<name>`):
 5. If you learned what a folder is for, update the folder map (`folder_map_save`, one short line per folder, keep existing lines).
 6. Reply briefly in Korean: which days were written and their main items.
 
-Unattended runs (a scheduled prompt, `opencode run`): nobody is there to answer. Never ask questions or wait for confirmation; decide, lower `confidence` where unsure, and finish. A run that ends without calling `daily_save` writes nothing.
+Unattended runs (a scheduled prompt, `opencode run`): nobody is there to answer. Never ask questions or wait for confirmation; decide, lower `confidence` where unsure, and finish. Do not start `baseline` or `doctor`. A run that ends without calling `daily_save` writes nothing.
 
 Daily item fields:
 - `topic_id`
@@ -121,4 +132,4 @@ When the user mentions work that leaves no trace in files (meetings, calls, revi
 
 ## First run
 
-With no topics and no folder map yet: run `overview(depth=2)`, read a few representative files (`read_file` with a short `max_chars`), save a folder map, and create topics for clearly ongoing work. The first close-outs after installation may show many `no_baseline` changes: describe them as the current state, not as new work.
+With no topics and no folder map yet: run `overview(depth=2)`, read at most 3 representative files (`read_file` with `max_chars` 2000: DRM files open through Office, which takes time), save a folder map, and create topics for clearly ongoing work. Folder and file names are usually enough. The first close-outs after installation may show many `no_baseline` changes: describe them as the current state, not as new work.

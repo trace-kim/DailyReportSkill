@@ -151,11 +151,11 @@ def test_drm_pdf_is_not_sent_to_word(tmp_path: Path, monkeypatch):
     calls = []
 
     class FakeCom:
-        def extract(self, app, path):
+        def extract(self, app, path, timeout=None):
             calls.append((app, Path(path).name))
             return "본문"
 
-        def shutdown(self):
+        def shutdown(self, wait=30):
             pass
 
     monkeypatch.setattr(extract_mod, "com_available", lambda: True)

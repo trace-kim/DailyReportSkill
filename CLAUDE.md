@@ -57,7 +57,10 @@ out by `storage.Workspace`.
    under a time budget (oldest first, at least one file per call) and returns `remaining`; the
    agent calls `close` until it is 0.
 3. `closeout.run_baseline` extracts text for `init` files once, so their first change has a real
-   diff. Baseline failures are not retried.
+   diff, newest first. Baseline failures are not retried. `baseline_where` skips files untouched for
+   `baseline_max_age_days` before install. Baseline and close share the `close` lock: a close that
+   has to wait touches `locks/close.wanted`, the baseline yields between files, and a budgeted
+   baseline (background job, morning) waits for the close and resumes.
 
 Change kinds: `added`, `modified`, `deleted`, `renamed` (hash match, or size+mtime for files never
 extracted), `resaved` (bytes changed, text did not, e.g. DRM re-encryption). Flags: `no_baseline`,
@@ -83,7 +86,8 @@ one reader there. `extract/com.py` is delicate:
 Always use `Extractor` as a context manager so Office instances are closed.
 
 **Storage.** SQLite in WAL mode (`index.db`). Cached document text and diffs are DPAPI-encrypted
-(`storage.TextVault`); diffs and scan events are pruned after a retention period.
+(`storage.TextVault`); diffs and scan events are pruned after a retention period. Schema changes
+bump `db.SCHEMA_VERSION` and add a step to `db._migrate` (existing installs keep their index).
 
 **Reports.** JSON is the source of truth (`reports/daily/<date>.json`, `reports/weekly/<from>_<to>.json`).
 The `.md` / `.txt` files are renders. Topics live in `topics.json` with stable IDs (`T001`...).
@@ -98,6 +102,7 @@ Daily reports store `covered_change_ids`, which is how `status` detects missing 
 `setup-opencode` installs them into the opencode config dir (`~/.config/opencode` or
 `$OPENCODE_CONFIG_DIR`) along with the `mcp.worklog` entry. Changing how the agent writes reports
 usually means editing those markdown files, not Python. opencode exposes the tools as `worklog_<name>`.
+A new command file must also be listed in `opencode_setup.COMMANDS`.
 `setup-opencode --workspace [DIR]` registers per workspace instead (`DIR/opencode.jsonc`,
 `DIR/.opencode/skills|commands`): DS Cowork's bundled opencode reads only that. Config backups go to
 `%LOCALAPPDATA%\worklog\backups`, never next to the config, because a workspace is usually the work folder.
@@ -106,6 +111,26 @@ usually means editing those markdown files, not Python. opencode exposes the too
 deliberately has no `from __future__ import annotations`, because the SDK evaluates annotations at
 runtime. Tools return JSON strings with `ensure_ascii=False`; `diff` and `read_file` return plain
 text. The tool docstrings are the agent-facing documentation.
+
+**Agent mode: every MCP call returns in time.** Agent apps time out tool calls (opencode's default
+is 60 s), and a folder can have tens of thousands of files, so the server sets `agent_mode` and
+`lock_wait` on its `Worklog`:
+- tools run in worker threads (`_tools` in `mcp_server.py`). A call that finds another one running
+  gets `WorklogBusy` after `AGENT_LOCK_WAIT` and answers `{"busy": true}` instead of queueing
+- `close` gets the budget `[agent] call_seconds` (30). Office waits are capped by an `Extractor`
+  deadline (budget + `HARD_GRACE_SECONDS`), and Office failures are remembered across calls
+  (`com_memory`)
+- `ensure_scan` reuses a scan whose walk *ended* recently (`taken_at + duration`). A slow scan
+  continues in a background thread (`_ScanJob`, own SQLite connection) while the call answers busy
+- nothing is written to the folder before the `init` tool (`_Folder` opens lazily), and `status`
+  never starts the first inventory
+- the `baseline` and `doctor` tools start `python -m worklog ...` processes (`_spawn`). `JobMarker`
+  makes a running job visible across processes. An agent app may keep its servers in a kill-on-close
+  Job Object (the MCP Python SDK does), and venv/console-script launchers nest a job of their own
+  inside it, so `CREATE_BREAKAWAY_FROM_JOB` can "succeed" while the child stays in the app's job.
+  `survives_session` therefore asks `IsProcessInJob` afterwards. Under libuv (Node) hosts the child
+  is in no job and survives
+- `status` reports missing install.ps1 tasks, found through the Task Scheduler COM API (`find_scheduled_tasks`)
 
 **Automation.** `scripts/install.ps1` creates `%LOCALAPPDATA%\worklog\venv` (a regular install, not
 editable), runs `init` and `setup-opencode`, and registers two Task Scheduler tasks with the
@@ -136,3 +161,8 @@ from overlapping.
   tests that edit right after `make_wl()` should `backdate_tracking` first.
 - COM tests disable pytest's faulthandler (`tests/test_com.py`): COM raises SEH exceptions that
   the RPC runtime handles, which faulthandler would print as "Windows fatal exception".
+- Agent-mode tests (`tests/test_agent.py`) set `wl.agent_mode = True` and a short `lock_wait`. To act
+  like a second process, use a second `Worklog` on the same root (its own connection) in a thread.
+  `conftest` stubs `find_scheduled_tasks` so the real tasks on the PC do not leak into tests, and
+  tests that start background jobs wait on `wl._procs[name][0]`. A scan is reused for 60 s, so tests
+  that change files after a scan backdate `scans.taken_at` first.

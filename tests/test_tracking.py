@@ -208,7 +208,7 @@ class _FlakyExtractor:
 
     calls = 0
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, **kwargs):
         pass
 
     def __enter__(self):

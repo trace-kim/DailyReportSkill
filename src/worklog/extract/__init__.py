@@ -6,6 +6,7 @@ later) means adding one function to ``DIRECT`` or ``COM_APPS``.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -61,10 +62,19 @@ DRM_PDF_SKIP = ("skipped: the file is not a PDF as stored on disk (DRM-protected
 
 
 class Extractor:
-    """Use as a context manager so hidden Office instances are always closed."""
+    """Use as a context manager so hidden Office instances are always closed.
 
-    def __init__(self, cfg: Config):
+    ``deadline`` (a ``time.monotonic()`` value) caps every Office wait so that a caller
+    with a time limit (an agent tool call) returns in time; Office is then also quit
+    with a short wait. ``memory`` is shared Office health state (see ``OfficeCom``).
+    """
+
+    SHUTDOWN_WAIT_LIMITED = 5.0
+
+    def __init__(self, cfg: Config, deadline: float | None = None, memory: dict | None = None):
         self.cfg = cfg
+        self.deadline = deadline
+        self.memory = memory
         self._com: OfficeCom | None = None
         self.text_exts = TEXT_EXTENSIONS | set(cfg.extra_text_extensions)
         self.skip = set(cfg.skip_extensions)
@@ -78,12 +88,13 @@ class Extractor:
     @property
     def com(self) -> OfficeCom:
         if self._com is None:
-            self._com = OfficeCom(timeout_sec=self.cfg.com_timeout_sec, pdf_via_word=self.cfg.com_pdf_via_word)
+            self._com = OfficeCom(timeout_sec=self.cfg.com_timeout_sec, pdf_via_word=self.cfg.com_pdf_via_word,
+                                  memory=self.memory)
         return self._com
 
     def close(self) -> None:
         if self._com is not None:
-            self._com.shutdown()
+            self._com.shutdown(wait=30 if self.deadline is None else self.SHUTDOWN_WAIT_LIMITED)
             self._com = None
 
     def category(self, path: Path) -> str:
@@ -144,8 +155,9 @@ class Extractor:
             elif not com_available():
                 errors.append("com: Office automation (pywin32) not available")
             else:
+                left = None if self.deadline is None else self.deadline - time.monotonic()
                 try:
-                    return self._text(self.com.extract(app, path), "com", meta)
+                    return self._text(self.com.extract(app, path, timeout=left), "com", meta)
                 except Exception as e:
                     errors.append(f"com: {_err(e)}")
         return ExtractResult("failed", error="; ".join(errors) or "no extractor", meta=meta)

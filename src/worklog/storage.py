@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
 import sys
 import tempfile
+import time
 import zlib
 from pathlib import Path
 
@@ -201,6 +203,43 @@ class FileLock:
             pass
         finally:
             fh.close()
+
+
+class JobMarker:
+    """Tells other processes that a long job (the baseline) is running, and since when.
+
+    The running process holds a lock next to a small JSON file. A file whose lock is
+    free was left by a process that died, so it never reports a job that is gone.
+    """
+
+    def __init__(self, ws: "Workspace", name: str):
+        self.lock = FileLock(ws.lock_path(f"job-{name}"))
+        self.info_path = ws.locks_dir / f"job-{name}.json"
+
+    def begin(self, **info) -> None:
+        if self.lock.acquire_wait(2):  # a probe may hold the lock for a moment
+            atomic_write_text(self.info_path, json.dumps({"pid": os.getpid(), "started": time.time(), **info}))
+
+    def end(self) -> None:
+        try:
+            self.info_path.unlink()
+        except OSError:
+            pass
+        self.lock.release()
+
+    @classmethod
+    def probe(cls, ws: "Workspace", name: str) -> dict | None:
+        """The running job's info, or None when no process runs it."""
+        m = cls(ws, name)
+        if not m.info_path.exists():
+            return None
+        if m.lock.acquire():
+            m.lock.release()
+            return None
+        try:
+            return json.loads(m.info_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
 
 
 # --------------------------------------------------------------------------

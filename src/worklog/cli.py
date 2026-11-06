@@ -20,15 +20,25 @@ def _setup_logging(data_dir: Path | None, verbose: bool) -> None:
     root.setLevel(logging.DEBUG if verbose else logging.INFO)
     for noisy in ("pypdf", "PIL", "mcp", "httpx", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    if data_dir is not None and data_dir.is_dir():
-        try:
-            (data_dir / "logs").mkdir(exist_ok=True)
-            handler = RotatingFileHandler(data_dir / "logs" / "worklog.log", maxBytes=2_000_000,
-                                          backupCount=3, encoding="utf-8")
-            handler.setFormatter(logging.Formatter("%(asctime)s [%(process)d] %(levelname)s %(name)s: %(message)s"))
-            root.addHandler(handler)
-        except OSError:
-            pass
+    if data_dir is not None:
+        add_file_log(data_dir)
+
+
+def add_file_log(data_dir: Path) -> None:
+    """Log to ``<data_dir>/logs/worklog.log`` (once per process; no-op until the folder exists)."""
+    if not data_dir.is_dir():
+        return
+    root = logging.getLogger()
+    path = (data_dir / "logs" / "worklog.log").resolve()
+    if any(isinstance(h, RotatingFileHandler) and Path(h.baseFilename) == path for h in root.handlers):
+        return
+    try:
+        path.parent.mkdir(exist_ok=True)
+        handler = RotatingFileHandler(path, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(process)d] %(levelname)s %(name)s: %(message)s"))
+        root.addHandler(handler)
+    except OSError:
+        pass
 
 
 def _print(obj) -> None:

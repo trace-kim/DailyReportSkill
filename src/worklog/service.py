@@ -17,7 +17,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from . import context
-from .closeout import candidate_counts, run_baseline, run_close
+from .closeout import HARD_GRACE_SECONDS, baseline_where, candidate_counts, run_baseline, run_close
 from .config import Config, set_report_command, write_default_config
 from .db import connect, get_meta, set_meta
 from .extract import Extractor
@@ -25,7 +25,7 @@ from .ignore import IgnoreRules
 from .reports import Reports
 from .scanner import MTIME_EPS
 from .scanner import scan as scan_folder
-from .storage import FileLock, TextVault, Workspace, atomic_write_text, hide_path
+from .storage import FileLock, JobMarker, TextVault, Workspace, atomic_write_text, hide_path
 from .topics import TopicStore
 
 log = logging.getLogger(__name__)
@@ -33,17 +33,36 @@ log = logging.getLogger(__name__)
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 _WEEKDAYS = "월화수목금토일"
 MAX_LISTED_DAYS = 31
+# Agent mode (MCP): how long a call waits for another call before answering busy.
+AGENT_LOCK_WAIT = 10.0
+# Agent mode: status reuses a scan up to this old, and waits this long for a new one.
+STATUS_SCAN_MAX_AGE = 600.0
+STATUS_SCAN_WAIT = 5.0
+TASKS_CACHE_SECONDS = 600.0
 
 
 class WorklogError(Exception):
     pass
 
 
+class WorklogBusy(WorklogError):
+    """Another call still holds the Worklog (typically one the agent stopped waiting for)."""
+
+
 def _locked(fn):
+    """Serialize calls. In agent mode a call that cannot get the lock within
+    ``lock_wait`` raises WorklogBusy instead of queueing behind a long call."""
+
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
-        with self._lock:
+        if not self._lock.acquire(timeout=-1 if self.lock_wait is None else self.lock_wait):
+            raise WorklogBusy(self._busy_message())
+        self._active.append((fn.__name__, time.monotonic()))
+        try:
             return fn(self, *args, **kwargs)
+        finally:
+            self._active.pop()
+            self._lock.release()
 
     return wrapper
 
@@ -95,6 +114,128 @@ def format_diff(d: dict) -> str:
     return "\n".join(lines) + "\n" + d.get("diff", "")
 
 
+# --------------------------------------------------------------------------
+# scheduled tasks (registered by scripts/install.ps1)
+# --------------------------------------------------------------------------
+_TASKS_CACHE: dict[str, tuple[float, dict | None]] = {}
+_ROOT_ARG = re.compile(r'--root\s+(?:"([^"]+)"|(\S+))')
+_TASK_RESULTS = {0: "ok", 0x41301: "running", 0x41303: "not run yet"}
+
+
+def task_root(arguments: str) -> str | None:
+    """The --root folder in a task's command-line arguments."""
+    m = _ROOT_ARG.search(arguments or "")
+    return (m.group(1) or m.group(2)) if m else None
+
+
+def same_folder(a: str | Path, b: str | Path) -> bool:
+    def norm(p) -> str:
+        try:
+            p = Path(p).resolve()  # also maps a drive letter to the UNC path, like Workspace does
+        except OSError:
+            p = Path(p)
+        return os.path.normcase(str(p).rstrip("\\/"))
+
+    return norm(a) == norm(b)
+
+
+def survives_session(pid: int) -> bool | None:
+    """Whether a process this server started outlives the app that started the server.
+
+    An agent app can keep its servers in a Job Object that it ends together with them (the
+    MCP Python SDK does, with KILL_ON_JOB_CLOSE and no breakaway). Jobs nest: the venv and
+    console-script launchers put Python in a job of their own inside the app's. The child
+    was started with CREATE_BREAKAWAY_FROM_JOB, which leaves every job that allows it and
+    still "succeeds" when an outer one does not, so any job it is still in forbids leaving
+    and can be ended with the session. libuv (Node) jobs let grandchildren leave silently,
+    so under such apps the child is in no job. None: it cannot be told.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import win32api
+        import win32con
+        import win32job
+
+        h = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        try:
+            return not win32job.IsProcessInJob(h, None)
+        finally:
+            win32api.CloseHandle(h)
+    except Exception as e:  # noqa: BLE001 - only a hint for the agent
+        log.debug("job check for pid %s: %s", pid, e)
+        return None
+
+
+def find_scheduled_tasks(root: Path) -> dict | None:
+    """worklog's Task Scheduler tasks for this folder: ``{"scan": {...}, "morning": {...}}``
+    with only the tasks found, or None when this cannot be checked. Cached for a while."""
+    if sys.platform != "win32":
+        return None
+    key = os.path.normcase(str(root))
+    hit = _TASKS_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < TASKS_CACHE_SECONDS:
+        return hit[1]
+    result = _query_tasks(Path(root))
+    _TASKS_CACHE[key] = (time.monotonic(), result)
+    return result
+
+
+def _query_tasks(root: Path) -> dict | None:
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError:
+        return None
+    initialized = False
+    try:
+        pythoncom.CoInitialize()
+        initialized = True
+        svc = win32com.client.Dispatch("Schedule.Service")
+        svc.Connect()
+        found: dict = {}
+        for t in svc.GetFolder("\\").GetTasks(1):  # 1 = TASK_ENUM_HIDDEN
+            name = str(t.Name)
+            low = name.lower()
+            kind = "scan" if low.startswith("worklog-scan-") else "morning" if low.startswith("worklog-morning-") else None
+            if kind is None:
+                continue
+            args = " ".join(str(a.Arguments or "") for a in t.Definition.Actions if getattr(a, "Type", None) == 0)
+            folder = task_root(args)
+            if not folder or not same_folder(folder, root):
+                continue
+            code = int(t.LastTaskResult) & 0xFFFFFFFF
+            try:
+                last = t.LastRunTime
+                last_run = last.strftime("%Y-%m-%dT%H:%M") if last.year >= 2000 else None
+            except Exception:
+                last_run = None
+            found[kind] = {"name": name, "enabled": bool(t.Enabled), "last_run": last_run,
+                           "last_result": _TASK_RESULTS.get(code, f"0x{code:X}")}
+        return found
+    except Exception as e:
+        log.debug("cannot query scheduled tasks: %s", e)
+        return None
+    finally:
+        if initialized:
+            pythoncom.CoUninitialize()
+
+
+class _ScanJob:
+    """A scan running in a background thread with its own database connection."""
+
+    def __init__(self) -> None:
+        self.requested = time.time()
+        self.started = time.monotonic()
+        self.progress = {"files": 0}
+        self.done = threading.Event()
+        self.result: dict | None = None
+        self.error: str | None = None
+
+    def state(self) -> dict:
+        return {"files_seen": self.progress["files"], "running_seconds": round(time.monotonic() - self.started)}
+
+
 class Worklog:
     def __init__(self, root: str | Path, create: bool = False):
         root = Path(root).expanduser()
@@ -115,6 +256,15 @@ class Worklog:
         self.topics = TopicStore(ws.topics_path, self.cfg.status_phrases.keys())
         self.reports = Reports(self)
         self._lock = threading.RLock()
+        self._active: list[tuple[str, float]] = []
+        # Agent mode is set by the MCP server: every call must return within the agent's
+        # tool-call timeout, so long work is bounded, moved to the background, or answered
+        # with busy. The CLI and the scheduled tasks keep the unbounded behaviour.
+        self.agent_mode = False
+        self.lock_wait: float | None = None
+        self.com_memory: dict = {}  # Office health shared by the calls of this process
+        self._scan_job: _ScanJob | None = None
+        self._procs: dict[str, tuple[subprocess.Popen, float]] = {}
 
     @classmethod
     def init(cls, root: str | Path, report_command: list[str] | None = None) -> tuple["Worklog", dict]:
@@ -172,19 +322,93 @@ class Worklog:
             row = self.con.execute("SELECT * FROM files WHERE path=? COLLATE NOCASE", (rel,)).fetchone()
         return row
 
+    @property
+    def initialized(self) -> bool:
+        """Tracking has started: the first inventory is recorded."""
+        return get_meta(self.con, "installed_at") is not None
+
     def baseline_remaining(self) -> int:
+        if not self.initialized:
+            return 0
+        where, params = baseline_where(self)
+        return self.con.execute(f"SELECT COUNT(*) FROM files WHERE {where}", params).fetchone()[0]
+
+    def baseline_skipped_old(self) -> int:
+        """Files left out of the baseline because they were not modified for a long time."""
         installed = get_meta(self.con, "installed_at")
-        if installed is None:
+        if installed is None or self.cfg.baseline_max_age_days <= 0:
             return 0
         return self.con.execute(
-            "SELECT COUNT(*) FROM files WHERE present=1 AND ext_at IS NULL AND origin='init' AND mtime <= ?",
-            (float(installed),),
+            "SELECT COUNT(*) FROM files WHERE present=1 AND ext_at IS NULL AND origin='init' AND mtime < ?",
+            (float(installed) - self.cfg.baseline_max_age_days * 86400,),
         ).fetchone()[0]
+
+    def _busy_message(self) -> str:
+        try:
+            name, since = self._active[0]
+        except IndexError:
+            name, since = "another", time.monotonic()
+        return (f"worklog is still working on an earlier '{name}' call ({time.monotonic() - since:.0f}s so far), "
+                "probably one whose answer the agent stopped waiting for. Call again in about a minute.")
 
     def _maybe_scan(self, max_age: float = 600) -> None:
         last = self.con.execute("SELECT MAX(taken_at) FROM scans").fetchone()[0]
         if last is None or time.time() - last > max_age:
             self.scan()
+
+    @_locked
+    def ensure_scan(self, max_age: float, wait: float | None) -> dict:
+        """Make the index reflect the folder as of at most ``max_age`` seconds ago.
+
+        With ``wait=None`` a needed scan runs in this thread (CLI). Otherwise it runs in
+        a background thread with its own connection and this waits up to ``wait``
+        seconds, so a slow folder (network or document-management drive) never holds a
+        tool call past its time limit: the scan goes on and a later call gets its result.
+        """
+        job = self._scan_job
+        if job is None:
+            # Age counts from the end of the walk: a slow walk is not stale the moment it ends.
+            last = self.con.execute("SELECT MAX(taken_at + COALESCE(duration, 0)) FROM scans").fetchone()[0]
+            if last is not None and time.time() - last <= max_age:
+                return {"ok": True, "reused": True, "age_seconds": round(time.time() - last)}
+            if wait is None:
+                return self.scan()
+            job = self._scan_job = _ScanJob()
+            threading.Thread(target=self._scan_worker, args=(job,), name="worklog-scan", daemon=True).start()
+        if not job.done.wait(wait):
+            st = job.state()
+            return {"ok": False, "busy": True, "scanning": True, **st,
+                    "message": f"Scanning the work folder takes longer than one call ({st['files_seen']:,} files "
+                               f"so far, {st['running_seconds']}s). It continues in the background: call again "
+                               "in about a minute."}
+        self._scan_job = None
+        if job.error:
+            return {"ok": False, "errors": [f"scan failed: {job.error}"]}
+        return job.result or {"ok": True}
+
+    def _scan_worker(self, job: _ScanJob) -> None:
+        con = None
+        try:
+            con = connect(self.ws.db_path, setup=False)
+            lock = FileLock(self.ws.lock_path("scan"))
+            if not lock.acquire_wait(900):
+                job.error = "another process has held the scan lock for 15 minutes"
+                return
+            try:
+                last = con.execute("SELECT MAX(taken_at) FROM scans").fetchone()[0]
+                if last is not None and last >= job.requested:  # another process scanned meanwhile
+                    job.result = {"ok": True, "reused": True, "age_seconds": round(time.time() - last)}
+                else:
+                    job.result = {"ok": True, **scan_folder(con, self.ws.root, self.rules(), progress=job.progress)}
+            finally:
+                lock.release()
+        except Exception as e:
+            log.exception("background scan failed")
+            job.error = f"{type(e).__name__}: {e}"
+        finally:
+            if con is not None:
+                con.close()
+            job.done.set()
 
     # ------------------------------------------------------------------
     # tracking
@@ -201,7 +425,51 @@ class Worklog:
 
     @_locked
     def close(self, budget_seconds: float | None = None) -> dict:
+        if self.agent_mode and not self.initialized:
+            if self._scan_job is None:
+                return {"ok": False, "errors": ["tracking has not started for this work folder: call init first"]}
+            started = self.ensure_scan(float("inf"), wait=budget_seconds)  # the first inventory is running
+            if not started.get("ok"):
+                return started
+            budget_seconds = 5.0  # the inventory used the time; nothing has changed since it anyway
         return run_close(self, budget_seconds)
+
+    @_locked
+    def start_tracking(self, wait: float) -> dict:
+        """``init`` for agents: start tracking without blocking the call.
+
+        The first inventory (names, sizes and dates; no file is opened) runs in the
+        background; this waits up to ``wait`` seconds for it. Calling it again on a
+        folder that is already tracked changes nothing.
+        """
+        already = self.initialized
+        if not already:
+            r = self.ensure_scan(float("inf"), wait=wait)
+            if r.get("scanning"):
+                return {"ok": True, "initialized": False, "root": str(self.ws.root),
+                        "inventory": {"running": True, "files_seen": r["files_seen"],
+                                      "running_seconds": r["running_seconds"]},
+                        "message": "The first inventory of the work folder (names, sizes and dates only; no file is "
+                                   "opened) continues in the background. Call status in about a minute; init does "
+                                   "not need to be called again."}
+            if not r.get("ok"):
+                return r
+        installed = float(get_meta(self.con, "installed_at"))
+        return {
+            "ok": True,
+            "initialized": True,
+            "already_initialized": already,
+            "root": str(self.ws.root),
+            "data_dir": str(self.ws.dir),
+            "tracking_since": _iso(installed),
+            "tracked_files": self.con.execute("SELECT COUNT(*) FROM files WHERE present=1").fetchone()[0],
+            "baseline_remaining": self.baseline_remaining(),
+            "baseline_skipped_old": self.baseline_skipped_old(),
+            "scheduled_tasks": find_scheduled_tasks(self.ws.root),
+            "next": ("Tracking was already set up; nothing was changed." if already else
+                     "Tracking started: changes from now on are recorded. Nothing can be reported before files "
+                     "change, so the first daily log is usually written the next day."),
+        }
 
     @_locked
     def baseline(self, budget_seconds: float | None = None) -> dict:
@@ -212,14 +480,26 @@ class Worklog:
     # ------------------------------------------------------------------
     @_locked
     def status(self) -> dict:
-        self._maybe_scan()
+        scanning = None
+        if self.agent_mode:
+            # Never start the first inventory from here (that is init's job), and never
+            # block on a slow scan: report it and go on with the previous scan's data.
+            if self.initialized or self._scan_job is not None:
+                r = self.ensure_scan(STATUS_SCAN_MAX_AGE, wait=STATUS_SCAN_WAIT)
+                if r.get("scanning"):
+                    scanning = {"files_seen": r["files_seen"], "running_seconds": r["running_seconds"]}
+        else:
+            self._maybe_scan()
+        initialized = self.initialized
         con = self.con
         now = time.time()
         today = self.cfg.today(now)
-        last_scan = con.execute("SELECT MAX(taken_at) FROM scans").fetchone()[0]
+        last_scan_row = con.execute("SELECT taken_at, duration FROM scans ORDER BY id DESC LIMIT 1").fetchone()
+        last_scan = last_scan_row["taken_at"] if last_scan_row else None
         last_close = con.execute("SELECT * FROM closes ORDER BY id DESC LIMIT 1").fetchone()
         pending = candidate_counts(self)
         baseline_left = self.baseline_remaining()
+        tasks = find_scheduled_tasks(self.ws.root)
 
         per_day: dict[str, dict] = defaultdict(lambda: {"ids": set(), "reportable": 0, "revised": 0.0})
         for r in con.execute("SELECT id, day, kind, revised_at FROM changes"):
@@ -249,6 +529,17 @@ class Worklog:
         needing = needing[-MAX_LISTED_DAYS:]
 
         hints = []
+        if not initialized:
+            if scanning:
+                hints.append(f"Tracking is starting: the first inventory of the work folder is running "
+                             f"({scanning['files_seen']:,} files so far). Call status again in a minute. Nothing "
+                             "can be reported until files change after it.")
+            else:
+                hints.append("Tracking has not started for this work folder: call init "
+                             "(in a terminal: worklog init).")
+        elif scanning:
+            hints.append(f"A scan of the work folder is running in the background ({scanning['files_seen']:,} "
+                         "files so far); the counts here are from the previous scan. close waits for it.")
         if pending["changed"]:
             hints.append(f"{pending['changed']} file change(s) are not closed out yet: call close "
                          "(repeat while 'remaining' > 0) before writing reports.")
@@ -256,8 +547,17 @@ class Worklog:
             hints.append(f"{pending['retry_failed']} file(s) failed text extraction earlier and will be retried "
                          "at the next close.")
         if baseline_left:
-            hints.append(f"Baseline extraction pending for {baseline_left} file(s): their first change will show "
-                         "full content instead of a diff. The 'baseline' tool or `worklog baseline` continues it.")
+            how = ("the morning task continues it, or the 'baseline' tool runs it in the background"
+                   if self.agent_mode else "`worklog baseline` or the morning task continues it")
+            hints.append(f"Baseline text is not captured yet for {baseline_left} file(s): their first change will "
+                         f"show the full content instead of a diff. Reports do not need it and nothing has to wait "
+                         f"for it; {how}.")
+        if initialized and tasks is not None and "scan" not in tasks:
+            hints.append("No scheduled tasks are installed for this folder: changes are recorded only when an agent "
+                         "calls close, and the baseline advances only when it is started. Tell the user that the "
+                         "hourly scan and the morning close-out are installed with the worklog installer: "
+                         f"powershell -ExecutionPolicy Bypass -File scripts\\install.ps1 -Root \"{self.ws.root}\" "
+                         "-Workspace -Report none (run from the worklog folder).")
         if older:
             hints.append(f"{older} older day(s) without reports are not listed.")
         last_run = self._last_report_run()
@@ -271,14 +571,20 @@ class Worklog:
                              "the usual cause is a report_command in config.toml without --model.")
         return {
             "root": str(self.ws.root),
+            "initialized": initialized,
             "today": today,
             "day_boundary": self.cfg.day_boundary.strftime("%H:%M"),
             "last_scan": _iso(last_scan),
+            "last_scan_seconds": last_scan_row["duration"] if last_scan_row else None,
+            "scan_running": scanning,
             "last_close": _iso(last_close["closed_at"]) if last_close else None,
             "last_close_remaining": last_close["remaining"] if last_close else None,
             "tracked_files": con.execute("SELECT COUNT(*) FROM files WHERE present=1").fetchone()[0],
             "pending_close": pending,
             "baseline_remaining": baseline_left,
+            "baseline_skipped_old": self.baseline_skipped_old(),
+            "background": self.jobs_state(),
+            "scheduled_tasks": tasks,
             "today_changes": per_day[today]["reportable"] if today in per_day else 0,
             "days_needing_report": needing,
             "daily_reports": len(self.reports.list_daily()),
@@ -415,7 +721,9 @@ class Worklog:
             else:
                 # Fresh extraction is NOT written to the cache: the cached text is
                 # the "before" state the next close-out diffs against.
-                with Extractor(self.cfg) as ex:
+                deadline = (time.monotonic() + self.cfg.agent_call_seconds + HARD_GRACE_SECONDS
+                            if self.agent_mode else None)
+                with Extractor(self.cfg, deadline=deadline, memory=self.com_memory) as ex:
                     res = ex.extract(p)
                 if res.kind == "image":
                     return {"ok": True, "path": rel, "kind": "image", "meta": res.meta,
@@ -517,6 +825,111 @@ class Worklog:
     @_locked
     def render(self, kind: str, key: str, fmt: str = "text") -> dict:
         return self.reports.render(kind, key, fmt)
+
+    # ------------------------------------------------------------------
+    # background jobs (agent mode): long Office work runs in its own process
+    # ------------------------------------------------------------------
+    def _spawn(self, args: list[str]) -> tuple[subprocess.Popen, bool | None]:
+        """Start ``python -m worklog <args> --root <root>`` in its own process, without a window.
+
+        Its own process because Office work can take long and must not share Office with
+        a tool call of this one. It gets no handle to this process's stdin/stdout, which
+        carry the MCP channel. Returns the process and whether it outlives the agent app's
+        session (``survives_session``).
+        """
+        cmd = [sys.executable, "-m", "worklog", *args, "--root", str(self.ws.root)]
+        base = _NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        for flags in ([base | breakaway, base] if breakaway else [base]):
+            try:
+                proc = subprocess.Popen(cmd, cwd=str(self.ws.root), stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        creationflags=flags, close_fds=True)
+                break
+            except OSError:  # breaking away is refused inside a job that forbids it
+                if flags == base:
+                    raise
+        return proc, survives_session(proc.pid)
+
+    def _baseline_running(self) -> dict | None:
+        """A running baseline: any process's marker, or one this server started that has not set it yet."""
+        info = JobMarker.probe(self.ws, "baseline")
+        if info is not None:
+            return {"since": _iso(info.get("started")), "pid": info.get("pid")}
+        own = self._procs.get("baseline")
+        if own is not None and own[0].poll() is None:
+            return {"since": _iso(own[1]), "pid": own[0].pid, "starting": True}
+        return None
+
+    def jobs_state(self) -> dict:
+        out: dict = {}
+        b = self._baseline_running()
+        if b is not None:
+            out["baseline"] = {"running": True, **b}
+        d = self._procs.get("doctor")
+        if d is not None and d[0].poll() is None:
+            out["doctor"] = {"running": True, "since": _iso(d[1])}
+        return out
+
+    @_locked
+    def start_baseline(self, minutes: float = 15) -> dict:
+        """Run the baseline in a background process for up to ``minutes``; returns at once."""
+        if not self.initialized:
+            return {"ok": False, "errors": ["tracking has not started for this work folder: call init first"]}
+        left = self.baseline_remaining()
+        running = self._baseline_running()
+        if running is not None:
+            return {"ok": True, "running": True, "since": running["since"], "remaining": left,
+                    "message": "A baseline run is already going in the background. Nothing to wait for."}
+        if not left:
+            return {"ok": True, "remaining": 0, "message": "Every file that needs a baseline has one."}
+        proc, survives = self._spawn(["baseline", "--budget", str(int(minutes * 60))])
+        self._procs["baseline"] = (proc, time.time())
+        msg = (f"The baseline runs in the background for up to {minutes:g} minutes, reading files through "
+               "Office where needed. It steps aside whenever a close-out needs the index and then goes on, so "
+               "keep working. Do not wait for it or call baseline again for it: status shows the progress "
+               "(baseline_remaining).")
+        if survives is not True:
+            later = ("the morning task continues it" if (find_scheduled_tasks(self.ws.root) or {}).get("morning")
+                     else "call baseline again in a later session to continue")
+            msg += (f" This agent app {'ends' if survives is False else 'may end'} background runs together with "
+                    f"the session, so it can stop early; the progress made is kept and {later}.")
+        return {"ok": True, "started": True, "pid": proc.pid, "minutes": minutes, "remaining": left,
+                "survives_session": survives, "message": msg}
+
+    @_locked
+    def doctor_job(self, rerun: bool = False, wait: float = 0) -> dict:
+        """The readability check (``worklog doctor``) as a background process.
+
+        Starts it when there is no result yet (or ``rerun``), waits up to ``wait``
+        seconds, and returns the result once there is one.
+        """
+        out_path = self.ws.logs_dir / "doctor-latest.json"
+        info = self._procs.get("doctor")
+        running = info is not None and info[0].poll() is None
+        if not running and (rerun or not out_path.exists()):
+            self.ws.logs_dir.mkdir(parents=True, exist_ok=True)
+            out_path.unlink(missing_ok=True)
+            info = self._procs["doctor"] = (self._spawn(["doctor", "--no-preview", "--out", str(out_path)])[0],
+                                            time.time())
+            running = True
+        if running:
+            try:
+                info[0].wait(timeout=max(0.0, wait))
+            except subprocess.TimeoutExpired:
+                return {"ok": True, "running": True, "since": _iso(info[1]),
+                        "message": "The check reads up to 3 recent files of each document type directly and "
+                                   "through Word, Excel and PowerPoint; it usually takes 1-3 minutes. Call doctor "
+                                   "again in a minute for the result."}
+        if not out_path.exists():
+            code = info[0].returncode if info is not None else None
+            return {"ok": False, "errors": [f"the check ended without a result (exit code {code}); its log is "
+                                            f"{self.ws.logs_dir / 'worklog.log'}"]}
+        report = json.loads(out_path.read_text(encoding="utf-8"))
+        return {"ok": True, "checked_at": report.get("time"), "verdicts": report.get("verdicts", []),
+                "office": report.get("office"), "session": report.get("session"),
+                "files_tested": len(report.get("files", [])), "report": str(out_path),
+                "note": "This is the latest result; doctor(rerun=true) checks again."}
 
     # ------------------------------------------------------------------
     # automation
